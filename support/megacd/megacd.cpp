@@ -11,6 +11,7 @@
 #include "../../menu.h"
 #include "../../cheats.h"
 #include "megacd.h"
+#include "megald.h"
 
 #define SAVE_IO_INDEX 5 // fake download to trigger save loading
 
@@ -83,6 +84,8 @@ void mcd_poll()
 	}
 	else
 		DisableIO();
+
+	ld_poll();
 }
 
 static char buf[1024];
@@ -183,6 +186,7 @@ void mcd_set_image(int num, const char *filename)
 
 void mcd_reset() {
 	need_reset = 1;
+	ld_reset();
 }
 
 int mcd_send_data(uint8_t* buf, int len, uint8_t index) {
