@@ -1300,6 +1300,17 @@ static void update_outputs()
 			sent_valid[r] = 1;
 		}
 	}
+	// player status, whenever the drive state, play mode or error flags change
+	static uint8_t last6 = 0xFF, last7 = 0xFF, last9 = 0xFF;
+	if (P.outputRegs[6] != last6 || P.outputRegs[7] != last7 || P.outputRegs[9] != last9)
+	{
+		last6 = P.outputRegs[6]; last7 = P.outputRegs[7]; last9 = P.outputRegs[9];
+		ld_log("status: out 06=%02X 07=%02X 09=%02X; drive lba %d (%s%s), frame no. %d; 0C=%02X",
+			last6, last7, last9, cdd.GetLBA(),
+			cdd.status == CD_STAT_PLAY ? "play" : cdd.status == CD_STAT_PAUSE ? "pause" : cdd.status == CD_STAT_SEEK ? "seek" :
+			cdd.status == CD_STAT_STOP ? "stop" : cdd.status == CD_STAT_OPEN ? "open" : cdd.status == CD_STAT_END ? "end" : "other",
+			cdd.latency ? ", seeking" : "", zeroBasedFrameIndexFromABA(current_aba()) + 1, P.inputRegs[0x0C]);
+	}
 	for (int r = 0x1A; r <= 0x1F; r++)
 	{
 		if (pending_events & (1u << r))
