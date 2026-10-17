@@ -1,14 +1,11 @@
-// LaserActive video test (stage 2). See megald_video.h.
+// LaserActive video: frame cache and commits. See megald_video.h.
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
 #include <pthread.h>
-#include <time.h>
+#include <unistd.h>
 
 #include "../../user_io.h"
 #include "../../file_io.h"
@@ -16,143 +13,196 @@
 #include "../../spi.h"
 #include "../../hardware.h"
 #include "../../shmem.h"
+#include "megald.h"
+#include "megald_mmi.h"
 #include "megald_video.h"
 
 // Core-specific HPS commands, answered by rtl/hps_ext.v in the MegaCD core.
 #define UIO_LD_VSET 0x52
 #define UIO_LD_VGET 0x53
-#define LDV_MAGIC   0x4C44  // reply to UIO_LD_VGET from a core that has the player
+#define LDV_MAGIC    0x4C44  // reply to UIO_LD_VGET from a core with the LD video player
+#define LDV_VERSION  3       // commit protocol
 
-#define LDV_OP_CONTROL 0    // word: bit0 enable, bit1 restart
-#define LDV_OP_PPS     1    // words: {addr[6:0], data[7:0]} ...
-#define LDV_OP_PARAMS  2    // words: frame_words[15:0], frame_words[17:16], field1_row
-#define LDV_OP_WRCOUNT 3    // word: frames written to the ring
+#define LDV_OP_CONTROL 0     // word: bit0 enable, bit1 restart, bit2 visible
+#define LDV_OP_PPS     1     // words: {addr[6:0], data[7:0]} ...
+#define LDV_OP_PARAMS  2     // words: frame_words[15:0], frame_words[17:16], field1_row
+#define LDV_OP_COMMIT  3     // word: slot to show next
 
-#define RING_ADDR  0x30100000u
-#define RING_SLOTS 8
-#define SLOT_SIZE  0x100000u
+#define SLOT_BASE  0x30100000u
+#define SLOTS      16
+#define SLOT_SIZE  0x80000u
+#define PREDICT    10        // frames to keep loaded ahead
 
-static int ldv_fd = -1;
-static char ldv_name[1024];
-static uint8_t ldv_pps[128];
-static uint32_t frame_count, frame_bytes, frame_stride, field1_row;
-static uint64_t frames_pos;   // file offset of frame 0
-static uint8_t *ring_map = NULL;
+// ------------------------------------------------------------------ state
+
+static const ld_disc *vd = NULL;     // disc being shown
+static ld_disc test_disc;
+static int test_mode = 0;
+
+static uint8_t *slot_map = NULL;
 static uint8_t *stage = NULL;
 
+struct slot_t
+{
+	int frame;          // stream frame held, -1 none
+	int loading;        // the reader thread is filling it
+	int committed;      // a commit used it ...
+	uint32_t seq;       // ... with this sequence number
+	uint32_t used;      // LRU stamp
+};
+
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t reader;
 static int reader_running = 0;
 static volatile int reader_stop = 0;
-static volatile uint32_t frames_written = 0;  // by the thread
-static volatile uint32_t frames_shown = 0;    // from the core, extended to 32 bits
-static volatile uint32_t read_errors = 0;
-static uint32_t start_frame = 0;
+static slot_t slots[SLOTS];
+static uint32_t lru_clock = 0;
+static int want[PREDICT + 1];
+static int want_n = 0;
+static int pending_frame = -1;       // requested, waiting for its slot
+static uint32_t read_errors = 0, loads = 0;
 
-static int need_setup = 0;
-static uint16_t sent_wr = 0xFFFF;
-static int core_ok = -1;
+static uint32_t pushed = 0;          // commits sent to the core
+static uint32_t done = 0;            // commits the core has finished (extended from 16 bits)
 
-// ------------------------------------------------------------- ZIP64 lookup
+// request bookkeeping
+#define REQS 64
+static struct { int id; int state; uint32_t seq; } reqs[REQS];   // state 0 waiting, 1 committed, 2 finished
+static int next_req = 0;
+static int pending_req = -1;
 
-static uint16_t rd16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-static uint32_t rd32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
-static uint64_t rd64(const uint8_t *p) { return rd32(p) | ((uint64_t)rd32(p + 4) << 32); }
+static int core_ok = 0;
+static int enabled = 0;
+static int visible = 0, sent_visible = -1;
+static uint16_t st[7];
 
-static int read_at(int fd, void *buf, size_t len, uint64_t off)
+// ------------------------------------------------------------- HPS <-> core
+
+static void send_control(int enable, int restart, int vis)
 {
-	uint8_t *b = (uint8_t *)buf;
-	while (len)
-	{
-		ssize_t r = pread(fd, b, len, (off_t)off);
-		if (r < 0 && errno == EINTR) continue;
-		if (r <= 0) return -1;
-		b += r; len -= r; off += r;
-	}
-	return 0;
+	spi_uio_cmd_cont(UIO_LD_VSET);
+	spi_w(LDV_OP_CONTROL);
+	spi_w((enable ? 1 : 0) | (restart ? 2 : 0) | (vis ? 4 : 0));
+	DisableIO();
 }
 
-// Data offset of the first stored entry whose name ends in ".dscv", or 0.
-static uint64_t find_dscv(int fd)
+static void send_setup(const ld_disc *d)
 {
-	uint64_t fsize = (uint64_t)lseek(fd, 0, SEEK_END);
-	size_t tail = fsize < 65557 ? (size_t)fsize : 65557;
-	uint8_t *buf = (uint8_t *)malloc(tail);
-	if (!buf || read_at(fd, buf, tail, fsize - tail)) { free(buf); return 0; }
-	long eocd = -1;
-	for (long i = (long)tail - 22; i >= 0; i--) if (rd32(buf + i) == 0x06054b50) { eocd = i; break; }
-	if (eocd < 0) { free(buf); return 0; }
-	uint64_t entries = rd16(buf + eocd + 10), cd_size = rd32(buf + eocd + 12), cd_off = rd32(buf + eocd + 16);
-	uint64_t eocd_abs = fsize - tail + eocd;
-	free(buf);
-	uint8_t loc[20], rec[56];
-	if (eocd_abs >= 20 && !read_at(fd, loc, 20, eocd_abs - 20) && rd32(loc) == 0x07064b50 &&
-		!read_at(fd, rec, 56, rd64(loc + 8)) && rd32(rec) == 0x06064b50)
-	{
-		entries = rd64(rec + 32);
-		cd_size = rd64(rec + 40);
-		cd_off = rd64(rec + 48);
-	}
-	if (cd_off + cd_size > fsize || cd_size > 16 * 1024 * 1024) return 0;
-	uint8_t *cd = (uint8_t *)malloc(cd_size);
-	if (!cd || read_at(fd, cd, cd_size, cd_off)) { free(cd); return 0; }
+	spi_uio_cmd_cont(UIO_LD_VSET);
+	spi_w(LDV_OP_PPS);
+	for (int i = 0; i < 128; i++) spi_w((uint16_t)((i << 8) | d->pps[i]));
+	DisableIO();
 
-	uint64_t found = 0;
-	size_t p = 0;
-	for (uint64_t e = 0; e < entries && p + 46 <= cd_size && rd32(cd + p) == 0x02014b50; e++)
+	uint32_t words = (d->frame_bytes + 7) / 8;
+	spi_uio_cmd_cont(UIO_LD_VSET);
+	spi_w(LDV_OP_PARAMS);
+	spi_w((uint16_t)words);
+	spi_w((uint16_t)(words >> 16));
+	spi_w((uint16_t)d->field1_row);
+	DisableIO();
+}
+
+static void send_commit(int slot)
+{
+	spi_uio_cmd_cont(UIO_LD_VSET);
+	spi_w(LDV_OP_COMMIT);
+	spi_w((uint16_t)slot);
+	DisableIO();
+}
+
+// 0 if the core doesn't have the commit-based player
+static int read_status()
+{
+	uint16_t magic = spi_uio_cmd_cont(UIO_LD_VGET);
+	if (magic != LDV_MAGIC)
 	{
-		uint16_t method = rd16(cd + p + 10), nlen = rd16(cd + p + 28), xlen = rd16(cd + p + 30), clen = rd16(cd + p + 32);
-		if (p + 46 + nlen + xlen + clen > cd_size) break;
-		uint64_t usize = rd32(cd + p + 24), csize = rd32(cd + p + 20), lofs = rd32(cd + p + 42);
-		const uint8_t *x = cd + p + 46 + nlen, *xe = x + xlen;
-		while (x + 4 <= xe)
-		{
-			uint16_t id = rd16(x), sz = rd16(x + 2);
-			const uint8_t *d = x + 4, *q = d;
-			if (d + sz > xe) break;
-			if (id == 0x0001)
-			{
-				if (usize == 0xffffffffu && q + 8 <= d + sz) { usize = rd64(q); q += 8; }
-				if (csize == 0xffffffffu && q + 8 <= d + sz) { csize = rd64(q); q += 8; }
-				if (lofs == 0xffffffffu && q + 8 <= d + sz) { lofs = rd64(q); q += 8; }
-			}
-			x = d + sz;
-		}
-		const char *name = (const char *)cd + p + 46;
-		if (!method && nlen > 5 && !strncasecmp(name + nlen - 5, ".dscv", 5))
-		{
-			uint8_t lh[30];
-			if (!read_at(fd, lh, 30, lofs) && rd32(lh) == 0x04034b50)
-			{
-				found = lofs + 30 + rd16(lh + 26) + rd16(lh + 28);
-				break;
-			}
-		}
-		p += 46 + nlen + xlen + clen;
+		DisableIO();
+		return 0;
 	}
-	free(cd);
-	return found;
+	for (int i = 0; i < 7; i++) st[i] = spi_w(0);
+	DisableIO();
+	return st[6] == LDV_VERSION;
 }
 
 // ------------------------------------------------------------ reader thread
 
+static int slot_of(int frame)
+{
+	for (int i = 0; i < SLOTS; i++) if (slots[i].frame == frame) return i;
+	return -1;
+}
+
+static bool pinned(int i)
+{
+	return slots[i].loading || (slots[i].committed && (int32_t)(slots[i].seq - done) >= 0);
+}
+
+// next frame to load and the slot for it; called with mtx held
+static bool pick_job(int &frame, int &slot)
+{
+	int order[PREDICT + 2];
+	int n = 0;
+	if (pending_frame >= 0) order[n++] = pending_frame;
+	for (int i = 0; i < want_n; i++) order[n++] = want[i];
+
+	for (int k = 0; k < n; k++)
+	{
+		int f = order[k];
+		if (slot_of(f) >= 0) continue;
+		// a victim: not in use, not wanted ahead of f; least recently used
+		int best = -1;
+		for (int i = 0; i < SLOTS; i++)
+		{
+			if (pinned(i)) continue;
+			bool keep = false;
+			for (int j = 0; j < k; j++) if (slots[i].frame == order[j]) keep = true;
+			if (keep) continue;
+			if (best < 0 || slots[i].frame < 0 || (slots[best].frame >= 0 && slots[i].used < slots[best].used)) best = i;
+			if (slots[best].frame < 0) break;
+		}
+		if (best < 0) return false;
+		frame = f;
+		slot = best;
+		return true;
+	}
+	return false;
+}
+
 static void *reader_thread(void *)
 {
-	uint32_t n = (frame_bytes + 7) & ~7u;
-	for (uint32_t k = frames_written; !reader_stop; k++)
+	while (!reader_stop)
 	{
-		// the slot being decoded (frames_shown % 8) and one spare stay untouched
-		while (!reader_stop && k >= frames_shown + RING_SLOTS - 1) usleep(1000);
-		if (reader_stop) break;
+		int f, s;
+		pthread_mutex_lock(&mtx);
+		bool job = vd && pick_job(f, s);
+		if (job)
+		{
+			slots[s].frame = f;
+			slots[s].loading = 1;
+			slots[s].committed = 0;
+			slots[s].used = ++lru_clock;
+		}
+		const ld_disc *d = vd;
+		pthread_mutex_unlock(&mtx);
+		if (!job)
+		{
+			usleep(1000);
+			continue;
+		}
 
-		uint32_t f = (start_frame + k) % frame_count;
-		if (read_at(ldv_fd, stage, frame_bytes, frames_pos + (uint64_t)f * frame_stride))
+		uint32_t n = (d->frame_bytes + 7) & ~7u;
+		if (!mmi_read(d, stage, d->frame_bytes, d->frames_off + (uint64_t)f * d->frame_stride))
 		{
 			read_errors++;
 			memset(stage, 0, n);
 		}
-		memcpy(ring_map + (size_t)(k % RING_SLOTS) * SLOT_SIZE, stage, n);
+		memcpy(slot_map + (size_t)s * SLOT_SIZE, stage, n);
 		__sync_synchronize();
-		frames_written = k + 1;
+
+		pthread_mutex_lock(&mtx);
+		slots[s].loading = 0;
+		loads++;
+		pthread_mutex_unlock(&mtx);
 	}
 	return NULL;
 }
@@ -168,177 +218,247 @@ static void reader_halt()
 	reader_stop = 0;
 }
 
-// ------------------------------------------------------------- HPS <-> core
+// ------------------------------------------------------------------ public
 
-static void send_control(int enable, int restart)
+static void reset_cache()
 {
-	spi_uio_cmd_cont(UIO_LD_VSET);
-	spi_w(LDV_OP_CONTROL);
-	spi_w((enable ? 1 : 0) | (restart ? 2 : 0));
-	DisableIO();
+	for (int i = 0; i < SLOTS; i++) slots[i] = { -1, 0, 0, 0, 0 };
+	want_n = 0;
+	pending_frame = -1;
+	pending_req = -1;
+	pushed = done = 0;
+	for (int i = 0; i < REQS; i++) reqs[i].id = -1;
 }
 
-static void send_setup()
+static int start(const ld_disc *d)
 {
-	spi_uio_cmd_cont(UIO_LD_VSET);
-	spi_w(LDV_OP_PPS);
-	for (int i = 0; i < 128; i++) spi_w((uint16_t)((i << 8) | ldv_pps[i]));
-	DisableIO();
-
-	uint32_t words = (frame_bytes + 7) / 8;
-	spi_uio_cmd_cont(UIO_LD_VSET);
-	spi_w(LDV_OP_PARAMS);
-	spi_w((uint16_t)words);
-	spi_w((uint16_t)(words >> 16));
-	spi_w((uint16_t)field1_row);
-	DisableIO();
-}
-
-static void send_wrcount(uint16_t w)
-{
-	spi_uio_cmd_cont(UIO_LD_VSET);
-	spi_w(LDV_OP_WRCOUNT);
-	spi_w(w);
-	DisableIO();
-}
-
-// returns 0 if the core doesn't answer
-static int read_status(uint16_t st[5])
-{
-	uint16_t magic = spi_uio_cmd_cont(UIO_LD_VGET);
-	if (magic != LDV_MAGIC)
+	if (d->frame_bytes > SLOT_SIZE)
 	{
-		DisableIO();
+		ld_log("video: frames of %u bytes don't fit the %u-byte slots", d->frame_bytes, SLOT_SIZE);
 		return 0;
 	}
-	for (int i = 0; i < 5; i++) st[i] = spi_w(0);
-	DisableIO();
+	if (!read_status())
+	{
+		ld_log("video: this core has no LaserDisc video player (version %u, need %u)", st[6], LDV_VERSION);
+		printf("LDV: this core has no LaserDisc video player matching this Main\n");
+		return 0;
+	}
+	if (!slot_map) slot_map = (uint8_t *)shmem_map(SLOT_BASE, SLOTS * SLOT_SIZE);
+	if (!stage) stage = (uint8_t *)malloc(SLOT_SIZE);
+	if (!slot_map || !stage)
+	{
+		ld_log("video: cannot map DDR3");
+		return 0;
+	}
+
+	reader_halt();
+	pthread_mutex_lock(&mtx);
+	reset_cache();
+	vd = d;
+	pthread_mutex_unlock(&mtx);
+	read_errors = loads = 0;
+
+	send_control(0, 1, 0);
+	send_setup(d);
+	send_control(1, 0, 0);
+	enabled = 1;
+	core_ok = 1;
+	visible = 0;
+	sent_visible = 0;
+
+	if (pthread_create(&reader, NULL, reader_thread, NULL) == 0) reader_running = 1;
+	unsigned bpp16 = ((d->pps[4] & 3) << 8) | d->pps[5];
+	ld_log("video: %u frames, %u bytes per frame (%.4g bpp)", d->frame_count, d->frame_bytes, bpp16 / 16.0);
 	return 1;
 }
 
-// ------------------------------------------------------------------ public
+static void stop()
+{
+	reader_halt();
+	pthread_mutex_lock(&mtx);
+	vd = NULL;
+	reset_cache();
+	pthread_mutex_unlock(&mtx);
+	if (enabled) send_control(0, 1, 0);
+	enabled = 0;
+	visible = 0;
+	sent_visible = 0;
+}
+
+int ld_video_attach(const ld_disc *d)
+{
+	if (test_mode)
+	{
+		stop();
+		mmi_close(&test_disc);
+		test_mode = 0;
+	}
+	return start(d);
+}
+
+void ld_video_detach()
+{
+	if (!test_mode) stop();
+}
+
+int ld_video_attached()
+{
+	return vd != NULL && !test_mode;
+}
+
+int ld_video_request(int frame)
+{
+	if (!vd || frame < 0 || (uint32_t)frame >= vd->frame_count) return -1;
+	pthread_mutex_lock(&mtx);
+	if (pending_req >= 0) reqs[pending_req % REQS].state = 2;   // replaced
+	int id = next_req++;
+	reqs[id % REQS].id = id;
+	reqs[id % REQS].state = 0;
+	pending_req = id;
+	pending_frame = frame;
+	pthread_mutex_unlock(&mtx);
+	return id;
+}
+
+int ld_video_request_done(int req)
+{
+	if (req < 0) return 1;
+	if (req < next_req - REQS) return 1;
+	int r = 1;
+	pthread_mutex_lock(&mtx);
+	if (reqs[req % REQS].id == req)
+	{
+		if (reqs[req % REQS].state == 0) r = 0;
+		else if (reqs[req % REQS].state == 1) r = (int32_t)(reqs[req % REQS].seq - done) < 0;
+	}
+	pthread_mutex_unlock(&mtx);
+	return r;
+}
+
+void ld_video_predict(int frame, int step)
+{
+	if (!vd) return;
+	pthread_mutex_lock(&mtx);
+	want_n = 0;
+	if (step == 0) step = 1;   // stills: keep the neighbours handy
+	for (int k = 1; k <= PREDICT; k++)
+	{
+		int f = frame + step * k;
+		if (f < 0 || (uint32_t)f >= vd->frame_count) break;
+		want[want_n++] = f;
+	}
+	pthread_mutex_unlock(&mtx);
+}
+
+void ld_video_set_visible(int v)
+{
+	visible = v ? 1 : 0;
+}
 
 void ld_video_open(const char *path)
 {
-	reader_halt();
-	if (ldv_fd >= 0)
+	if (vd && !test_mode)
 	{
-		send_control(0, 1);
-		close(ldv_fd);
-		ldv_fd = -1;
-		printf("LDV: closed %s\n", ldv_name);
+		Info("LaserDisc in the drive: eject it first", 3000);
+		return;
 	}
+	stop();
+	mmi_close(&test_disc);
+	test_mode = 0;
 	if (!path || !*path) return;
 
-	snprintf(ldv_name, sizeof(ldv_name), "%s", path);
-	char full[2048];
+	char full[1024], err[128];
 	if (path[0] == '/') snprintf(full, sizeof(full), "%s", path);
 	else snprintf(full, sizeof(full), "%s/%s", getRootDir(), path);
-
-	int fd = open(full, O_RDONLY | O_CLOEXEC);
-	if (fd < 0)
+	if (!mmi_open(&test_disc, full, 0, err, sizeof(err)) || !test_disc.has_video)
 	{
-		printf("LDV: cannot open %s\n", full);
-		Info("LD video: cannot open file", 3000);
+		Info(test_disc.fd < 0 ? err : "LD video: no .dscv video in this file", 3000);
+		mmi_close(&test_disc);
 		return;
 	}
-	uint64_t base = find_dscv(fd);
-	uint8_t h[512];
-	if (!base || read_at(fd, h, sizeof(h), base) || memcmp(h, "DSCV", 4))
+	if (!start(&test_disc))
 	{
-		printf("LDV: %s has no DSCV video stream\n", full);
-		Info("LD video: not a .dscmmi file", 3000);
-		close(fd);
+		Info("LD video: this core can't show it", 3000);
+		mmi_close(&test_disc);
 		return;
 	}
-	frame_count = rd32(h + 28);
-	frame_bytes = rd32(h + 40);
-	frame_stride = rd32(h + 44);
-	frames_pos = base + rd64(h + 48);
-	field1_row = rd16(h + 24);
-	memcpy(ldv_pps, h + 128, 128);
-	if (!frame_count || !frame_bytes || frame_bytes > SLOT_SIZE)
-	{
-		printf("LDV: bad DSCV header\n");
-		Info("LD video: bad DSCV header", 3000);
-		close(fd);
-		return;
-	}
-
-	if (!ring_map) ring_map = (uint8_t *)shmem_map(RING_ADDR, RING_SLOTS * SLOT_SIZE);
-	if (!stage) stage = (uint8_t *)malloc(SLOT_SIZE);
-	if (!ring_map || !stage)
-	{
-		printf("LDV: cannot map the DDR3 ring\n");
-		close(fd);
-		return;
-	}
-
-	ldv_fd = fd;
-	start_frame = 0;
-	frames_written = 0;
-	frames_shown = 0;
-	read_errors = 0;
-	sent_wr = 0xFFFF;
-	core_ok = -1;
-	need_setup = 1;
-
-	unsigned bpp16 = ((ldv_pps[4] & 3) << 8) | ldv_pps[5];
-	printf("LDV: playing %s: %u frames, %u bytes/frame, %.4g bpp, field 1 at row %u\n", full, frame_count, frame_bytes,
-		bpp16 / 16.0, field1_row);
-	// ld_video_poll() sends the PPS to the core and starts the reader thread
+	test_mode = 1;
+	visible = 1;
+	ld_log("video test: playing %s", full);
 }
 
 void ld_video_poll()
 {
-	static uint32_t timer = 0;
-	static uint32_t report = 0;
-	if (ldv_fd < 0) return;
+	static uint32_t timer = 0, report = 0;
+	static uint32_t test_next = 0;
+	static uint32_t test_frame = 0;
+	if (!vd) return;
 	if (timer && !CheckTimer(timer)) return;
 	timer = GetTimer(2);
 
-	if (need_setup)
+	if (!read_status())
 	{
-		// New file: reset the core's player, send it the stream's PPS and
-		// sizes, then start filling the ring from frame 0.
-		need_setup = 0;
-		reader_halt();
-		start_frame = (start_frame + frames_shown) % frame_count;
-		frames_written = 0;
-		frames_shown = 0;
-		sent_wr = 0xFFFF;
-		send_control(0, 1);
-		send_setup();
-		send_control(1, 0);
-		if (pthread_create(&reader, NULL, reader_thread, NULL) == 0) reader_running = 1;
+		if (core_ok) ld_log("video: the core stopped answering");
+		core_ok = 0;
+		return;
 	}
+	core_ok = 1;
 
-	uint16_t st[5];
-	int ok = read_status(st);
-	if (ok != core_ok)
+	// the test plays the stream from frame 0 on this clock
+	if (test_mode)
 	{
-		core_ok = ok;
-		if (!ok) printf("LDV: this core has no LD video player (rebuild with the LaserActive branch)\n");
+		uint32_t now = GetTimer(0);
+		if (!test_next) { test_next = now; test_frame = 0; }
+		if ((int32_t)(now - test_next) >= 0)
+		{
+			test_next += (test_frame % 3) ? 33 : 34;   // 29.97 Hz on average (33.37 ms)
+			ld_video_request(test_frame);
+			ld_video_predict(test_frame, 1);
+			test_frame = (test_frame + 1) % vd->frame_count;
+		}
 	}
-	if (!ok) return;
+	else test_next = 0;
 
-	// extend the core's 16-bit counter
-	uint32_t shown = frames_shown;
-	shown += (uint16_t)(st[0] - (uint16_t)shown);
-	frames_shown = shown;
+	pthread_mutex_lock(&mtx);
+	done += (uint16_t)(st[0] - (uint16_t)done);
+	for (int i = 0; i < REQS; i++)
+		if (reqs[i].id >= 0 && reqs[i].state == 1 && (int32_t)(reqs[i].seq - done) < 0) reqs[i].state = 2;
 
-	uint16_t w = (uint16_t)frames_written;
-	if (w != sent_wr)
+	// commit the pending frame once its slot is loaded and the core has room
+	int level = (st[4] >> 1) & 7;
+	if (pending_frame >= 0 && level < 3)
 	{
-		send_wrcount(w);
-		sent_wr = w;
+		int s = slot_of(pending_frame);
+		if (s >= 0 && !slots[s].loading)
+		{
+			slots[s].committed = 1;
+			slots[s].seq = pushed;
+			slots[s].used = ++lru_clock;
+			if (pending_req >= 0)
+			{
+				reqs[pending_req % REQS].state = 1;
+				reqs[pending_req % REQS].seq = pushed;
+			}
+			pushed++;
+			pending_frame = -1;
+			pending_req = -1;
+			pthread_mutex_unlock(&mtx);
+			send_commit(s);
+			pthread_mutex_lock(&mtx);
+		}
+	}
+	pthread_mutex_unlock(&mtx);
+
+	if (visible != sent_visible)
+	{
+		send_control(1, 0, visible);
+		sent_visible = visible;
 	}
 
 	if (!report || CheckTimer(report))
 	{
-		report = GetTimer(5000);
-		printf("LDV: shown %u (disc frame %u), ring %u, late ticks %u, decode errors %u, decode %.1f ms, read errors %u\n",
-			frames_shown, (start_frame + frames_shown) % frame_count, frames_written - frames_shown, st[1], st[2],
-			st[3] * 256 / 53693.175, read_errors);
+		report = GetTimer(10000);
+		ld_log("video: %u commits, %u shown, %u repeated ticks, %u skipped, %u decode errors, decode %.1f ms, %u loads, %u read errors%s",
+			pushed, done, st[1], st[5], st[2], st[3] * 256 / 53693.175, loads, read_errors, visible ? "" : ", hidden");
 	}
 }

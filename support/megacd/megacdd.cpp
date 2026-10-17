@@ -6,6 +6,8 @@
 #include <time.h>
 
 #include "megacd.h"
+#include "megald.h"
+#include "megald_mmi.h"
 #include "../chd/mister_chd.h"
 
 cdd_t cdd;
@@ -24,6 +26,7 @@ cdd_t::cdd_t() {
 	chd_hunknum = -1;
 	SendData = NULL;
 	CanSendData = NULL;
+	ld_mode = 0;
 
 	stat[0] = 0xB;
 	stat[1] = 0x0;
@@ -71,19 +74,38 @@ static int sgets(char *out, int sz, char **in)
 }
 
 
+// A track file named by a cue sheet: a file next to the .cue, or for a
+// LaserDisc image, an entry in the same archive folder as the cue entry.
+int cdd_t::OpenTrackFile(fileTYPE *f, const char *name, int in_archive)
+{
+	if (!in_archive) return FileOpen(f, name);
+	const ld_disc *d = ld_get_disc();
+	const mmi_entry *e = d ? mmi_find(d, name) : NULL;
+	if (!e)
+	{
+		printf("\x1b[32mMCD: %s is not in the archive\n\x1b[0m", name);
+		return 0;
+	}
+	return FileOpenSub(f, d->path, e->off, e->size);
+}
+
 int cdd_t::LoadCUE(const char* filename) {
+	static char toc[100 * 1024];
+
+	memset(toc, 0, sizeof(toc));
+	if (!FileLoad(filename, toc, sizeof(toc) - 1)) return 1;
+
+	printf("\x1b[32mMCD: Open CUE: %s\n\x1b[0m", filename);
+	return ParseCUE(toc, filename, 0);
+}
+
+int cdd_t::ParseCUE(char *toc, const char *cue_name, int in_archive) {
 	static char fname[1024 + 10];
 	static char line[128];
 	char *ptr, *lptr;
 	static char header[1024];
-	static char toc[100 * 1024];
 
-	strcpy(fname, filename);
-
-	memset(toc, 0, sizeof(toc));
-	if (!FileLoad(fname, toc, sizeof(toc) - 1)) return 1;
-
-	printf("\x1b[32mMCD: Open CUE: %s\n\x1b[0m", fname);
+	snprintf(fname, sizeof(fname), "%s", cue_name);
 
 	int mm, ss, bb, pregap = 0;
 
@@ -116,7 +138,7 @@ int cdd_t::LoadCUE(const char* filename) {
 			}
 			*ptr = 0;
 
-			if(!FileOpen(&this->toc.tracks[this->toc.last].f, fname)) return -1;
+			if(!OpenTrackFile(&this->toc.tracks[this->toc.last].f, fname, in_archive)) return -1;
 
 			printf("\x1b[32mMCD: Open track file: %s\n\x1b[0m", fname);
 
@@ -195,7 +217,7 @@ int cdd_t::LoadCUE(const char* filename) {
 
 			if (!this->toc.tracks[this->toc.last].f.opened())
 			{
-				FileOpen(&this->toc.tracks[this->toc.last].f, fname);
+				OpenTrackFile(&this->toc.tracks[this->toc.last].f, fname, in_archive);
 				this->toc.tracks[this->toc.last].start = bb + ss * 75 + mm * 60 * 75 + pregap;
 				if (this->toc.last && !this->toc.tracks[this->toc.last - 1].end)
 				{
@@ -230,8 +252,11 @@ int cdd_t::LoadCUE(const char* filename) {
 		this->toc.tracks[this->toc.last - 1].end = this->toc.end;
 	}
 
-        memcpy(&fname[strlen(fname) - 4], ".sub", 4);
-        FileOpen(&this->toc.sub, getFullPath(fname));
+	if (!in_archive && strlen(fname) > 4)
+	{
+		memcpy(&fname[strlen(fname) - 4], ".sub", 4);
+		FileOpen(&this->toc.sub, getFullPath(fname));
+	}
 
 	FileClose(&this->toc.tracks[this->toc.last].f);
 	return 0;
@@ -244,14 +269,36 @@ int cdd_t::Load(const char *filename)
 	fileTYPE *fd_img;
 
 	Unload();
+	ld_mode = 0;
 
 	const char *ext = filename+strlen(filename)-4;
-	if (!strncasecmp(".cue", ext, 4))
+	if (mmi_is_archive_name(filename))
 	{
+		// LaserActive disc: the digital track is a cue sheet inside the archive
+		static char cue[100 * 1024];
+		const ld_disc *d = ld_disc_mount(filename);
+		const mmi_entry *e = d ? mmi_find(d, d->redbook.c_str()) : NULL;
+		memset(cue, 0, sizeof(cue));
+		if (!e || e->size >= sizeof(cue) || !mmi_read(d, cue, e->size, e->off))
+		{
+			ld_disc_unmount();
+			return (-1);
+		}
+		printf("\x1b[32mMCD: LaserDisc %s, digital track %s\n\x1b[0m", filename, d->redbook.c_str());
+		if (ParseCUE(cue, d->redbook.c_str(), 1))
+		{
+			ld_disc_unmount();
+			return (-1);
+		}
+		ld_mode = 1;
+	} else if (!strncasecmp(".cue", ext, 4))
+	{
+		ld_disc_unmount();
 		if (LoadCUE(filename)) {
 			return (-1);
 		}
 	} else if (!strncasecmp(".chd", ext, 4))  {
+		ld_disc_unmount();
 		chd_error err = mister_load_chd(filename, &this->toc);
 		if (err != CHDERR_NONE)
 		{
@@ -396,6 +443,12 @@ void cdd_t::Update() {
 			return;
 		}
 
+		if (this->ld_mode)
+		{
+			LDUpdate();
+			return;
+		}
+
 		if (this->index >= this->toc.last)
 		{
 			this->status = CD_STAT_END;
@@ -495,6 +548,106 @@ void cdd_t::Update() {
 			FileSeek(&this->toc.tracks[this->index].f, (this->lba * 2352) - this->toc.tracks[this->index].offset, SEEK_SET);
 		}
 	}
+}
+
+// ------------------------------------------------------------- LaserActive
+
+void cdd_t::LDSeek(int lba, int play)
+{
+	if (lba < -150) lba = -150;
+	if (lba >= this->toc.end) lba = this->toc.end - 1;
+	SeekToLBA(lba, play);
+	this->status = play ? CD_STAT_PLAY : CD_STAT_SEEK;
+	if (!play && !this->latency) this->status = CD_STAT_PAUSE;
+	this->isData = this->toc.tracks[this->index].type ? 1 : 0;
+}
+
+void cdd_t::LDPlay()
+{
+	// a seek in progress ends in play instead of pause
+	if (this->status == CD_STAT_PLAY || this->status == CD_STAT_SEEK) this->status = CD_STAT_PLAY;
+	else if (this->loaded) this->status = CD_STAT_PLAY;
+}
+
+void cdd_t::LDPause()
+{
+	if (this->status == CD_STAT_PLAY && this->latency > 0) this->status = CD_STAT_SEEK;
+	else if (this->status == CD_STAT_PLAY || this->status == CD_STAT_SCAN || this->status == CD_STAT_END) this->status = CD_STAT_PAUSE;
+}
+
+void cdd_t::LDStop()
+{
+	this->status = this->loaded ? CD_STAT_STOP : CD_STAT_NO_DISC;
+	this->latency = 0;
+	this->isData = 1;
+}
+
+void cdd_t::LDOpenTray()
+{
+	this->status = CD_STAT_OPEN;
+	this->latency = 0;
+	this->isData = 1;
+}
+
+// One sector tick while a LaserDisc plays. The tick is paced by the core's
+// CD audio FIFO (one 2352-byte sector of audio is sent per tick, digital,
+// analog or silence), so the disc runs at exactly 75 sectors a second on the
+// core's clock. As in ares (MCD::CDD::clock/sample/advance), the current
+// sector's data and audio are sent, then the player decides how far to move.
+void cdd_t::LDUpdate()
+{
+	if (CanSendData && !CanSendData(0)) return;
+
+	if (this->lba >= this->toc.end || this->toc.last == 0)
+	{
+		this->status = CD_STAT_END;
+		this->isData = 1;
+		ld_sector_reached(this->lba, 1);
+		return;
+	}
+
+	this->index = this->toc.GetTrackByLBA(this->lba);
+	int data = this->toc.tracks[this->index].type ? 1 : 0;
+	this->isData = data;
+
+	if (data && this->lba >= 0)
+	{
+		uint8_t header[4];
+		msf_t msf;
+		LBAToMSF(this->lba + 150, &msf);
+		header[0] = BCD(msf.m);
+		header[1] = BCD(msf.s);
+		header[2] = BCD(msf.f);
+		header[3] = 0x01;
+		SectorSend(header);
+	}
+
+	static uint8_t audio[2352];
+	int have_digital = 0;
+	memset(audio, 0, sizeof(audio));
+	if (!data && this->lba >= this->toc.tracks[this->index].start && this->toc.tracks[this->index].f.opened())
+	{
+		FileSeek(&this->toc.tracks[this->index].f, (__off64_t)this->lba * 2352 - this->toc.tracks[this->index].offset, SEEK_SET);
+		have_digital = FileReadAdv(&this->toc.tracks[this->index].f, audio, 2352) == 2352;
+		if (!have_digital) memset(audio, 0, sizeof(audio));
+	}
+	ld_mix_audio((int16_t *)audio, this->lba, have_digital);
+	if (SendData) SendData(audio, 2352, MCD_CDDA_IO_INDEX);
+
+	int next = this->lba + ld_sector_advance();
+	if (next < -150) next = -150;
+	if (next >= this->toc.end)
+	{
+		this->lba = this->toc.end;
+		this->status = CD_STAT_END;
+		this->isData = 1;
+		ld_sector_reached(this->lba, 1);
+		return;
+	}
+	this->lba = next;
+	this->chd_audio_read_lba = next;
+	this->index = this->toc.GetTrackByLBA(next);
+	ld_sector_reached(next, 0);
 }
 
 void cdd_t::CommandExec() {

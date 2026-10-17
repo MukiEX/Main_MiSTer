@@ -135,6 +135,7 @@ fileTYPE::fileTYPE()
 	zip = 0;
 	size = 0;
 	offset = 0;
+	base = 0;
 }
 
 fileTYPE::~fileTYPE()
@@ -466,6 +467,7 @@ int FileOpenEx(fileTYPE *file, const char *name, int mode, char mute, int use_zi
 	FileClose(file);
 	file->mode = 0;
 	file->type = 0;
+	file->base = 0;
 
 	char *p = strrchr(full_path, '/');
 	strcpy(file->name, (mode == -1) ? full_path : p + 1);
@@ -616,6 +618,20 @@ __off64_t FileGetSize(fileTYPE *file)
 	return 0;
 }
 
+int FileOpenSub(fileTYPE *file, const char *name, __off64_t base, __off64_t size, char mute)
+{
+	if (!FileOpenEx(file, name, O_RDONLY, mute, 0)) return 0;
+	if (!file->filp || base < 0 || size < 0 || base + size > file->size)
+	{
+		if (!mute) printf("FileOpenSub: bad range %lld+%lld in %s\n", base, size, name);
+		FileClose(file);
+		return 0;
+	}
+	file->base = base;
+	file->size = size;
+	return FileSeek(file, 0, SEEK_SET);
+}
+
 int FileOpen(fileTYPE *file, const char *name, char mute)
 {
 	return FileOpenEx(file, name, O_RDONLY, mute);
@@ -625,13 +641,14 @@ int FileSeek(fileTYPE *file, __off64_t offset, int origin)
 {
 	if (file->filp)
 	{
+		if (origin == SEEK_SET) offset += file->base;
 		__off64_t res = fseeko64(file->filp, offset, origin);
 		if (res < 0)
 		{
 			printf("Fail to seek the file: offset=%lld, %s.\n", offset, file->name);
 			return 0;
 		}
-		offset = ftello64(file->filp);
+		offset = ftello64(file->filp) - file->base;
 	}
 	else if (file->zip)
 	{

@@ -30,8 +30,9 @@ void mcd_poll()
 
 	if (!poll_timer || CheckTimer(poll_timer))
 	{
-		if (!cdd.isData && cdd.status == CD_STAT_PLAY && cdd.latency == 0) {
-			// Send audio sectors faster so buffer stays filled
+		if ((!cdd.isData || cdd.ld_mode) && cdd.status == CD_STAT_PLAY && cdd.latency == 0) {
+			// Send audio sectors faster so buffer stays filled (a LaserDisc
+			// always sends audio: its analog track plays over data too)
 			poll_timer = GetTimer(10);
 			adj = 0;
 		} else {
@@ -125,7 +126,7 @@ void mcd_set_image(int num, const char *filename)
 {
 	static char last_dir[1024] = {};
 
-	// S1: LaserActive video test (.dscmmi), separate from the CD drive
+	// S1: LaserActive video test (.dscmmi): plays the video on its own
 	if (num == 1)
 	{
 		ld_video_open(filename);
@@ -134,6 +135,7 @@ void mcd_set_image(int num, const char *filename)
 
 	cdd.Unload();
 	cdd.status = CD_STAT_OPEN;
+	if (!*filename) ld_disc_unmount();
 
 	int same_game = *filename && *last_dir && !strncmp(last_dir, filename, strlen(last_dir));
 	strcpy(last_dir, filename);

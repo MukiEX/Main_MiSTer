@@ -52,6 +52,12 @@ public:
 	SendDataFunc SendData;
 	int (*CanSendData)(uint8_t type);
 
+	// LaserActive: a LaserDisc image (.dscmmi) is mounted. Its digital track
+	// is read from inside the archive, and while it plays the LaserDisc
+	// player (megald.cpp) decides how far each sector tick moves and mixes
+	// the analog audio into the CD audio stream.
+	int ld_mode;
+
 	cdd_t();
 	int Load(const char *filename);
 	void Unload();
@@ -60,6 +66,23 @@ public:
 	void CommandExec();
 	uint64_t GetStatus(uint8_t crc_start);
 	int SetCommand(uint64_t c, uint8_t crc_start);
+
+	// for the LaserDisc player (megald.cpp)
+	int GetLBA() { return lba; }
+	int GetTrackIndex() { return index; }            // 0-based
+	int TrackCount() { return toc.last; }
+	int TrackStart(int i) { return toc.tracks[i].start; }
+	int TrackEnd(int i) { return toc.tracks[i].end; }
+	int TrackIsData(int i) { return toc.tracks[i].type ? 1 : 0; }
+	int DiscEnd() { return toc.end; }
+	int TrackOfLBA(int l) { return toc.GetTrackByLBA(l); }
+	void LDSeek(int lba, int play);                   // paused seek ends in PAUSE
+	void LDPlay();
+	void LDPause();
+	void LDStop();
+	void LDOpenTray();
+	int LDSeeking() { return latency > 0 && (status == CD_STAT_PLAY || status == CD_STAT_SEEK); }
+	int LDPlaying() { return status == CD_STAT_PLAY && latency == 0; }
 
 private:
 	toc_t toc;
@@ -76,6 +99,9 @@ private:
 	uint8_t comm[10];
 
 	int LoadCUE(const char* filename);
+	int ParseCUE(char *toc_text, const char *cue_name, int in_archive);
+	int OpenTrackFile(fileTYPE *f, const char *name, int in_archive);
+	void LDUpdate();
 	int LoadCHD(const char* filename);
 	int SectorSend(uint8_t* header);
 	int SubcodeSend();

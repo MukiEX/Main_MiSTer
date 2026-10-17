@@ -22,6 +22,7 @@ struct fileTYPE
 	fileZipArchive *zip;
 	__off64_t       size;
 	__off64_t       offset;
+	__off64_t       base;   // FileOpenSub: start of the part of the file this handle covers
 	char            path[1024];
 	char            name[261];
 };
@@ -84,6 +85,9 @@ int  isUSBMounted();
 
 int  FileOpenZip(fileTYPE *file, const char *name, uint32_t crc32);
 int  FileOpenEx(fileTYPE *file, const char *name, int mode, char mute = 0, int use_zip = 1);
+// Read-only handle on bytes [base, base + size) of a plain file, e.g. a stored
+// entry inside an uncompressed archive. Seeks and sizes are relative to base.
+int  FileOpenSub(fileTYPE *file, const char *name, __off64_t base, __off64_t size, char mute = 0);
 int  FileOpen(fileTYPE *file, const char *name, char mute = 0);
 int FileClose(fileTYPE *file);
 
