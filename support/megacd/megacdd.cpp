@@ -610,7 +610,11 @@ void cdd_t::LDUpdate()
 	int data = this->toc.tracks[this->index].type ? 1 : 0;
 	this->isData = data;
 
-	if (data && this->lba >= 0)
+	// Data sectors go out for the pregap too (no data, but a header and a
+	// decoder interrupt each): the BIOS seeks a few sectors before its
+	// target and gives up if the decoder stays silent, as Main's normal
+	// CD path and ares also do.
+	if (data)
 	{
 		uint8_t header[4];
 		msf_t msf;
