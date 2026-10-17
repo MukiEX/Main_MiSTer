@@ -126,12 +126,7 @@ void mcd_set_image(int num, const char *filename)
 {
 	static char last_dir[1024] = {};
 
-	// S1: LaserActive video test (.dscmmi): plays the video on its own
-	if (num == 1)
-	{
-		ld_video_open(filename);
-		return;
-	}
+	if (num != 0) return;
 
 	cdd.Unload();
 	cdd.status = CD_STAT_OPEN;

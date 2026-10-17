@@ -63,6 +63,8 @@ static FILE *log_fp = NULL;
 static FILE *regs_fp = NULL;
 static int cfg_log_regs = 0;
 static int cfg_log_reads = 0;
+static double cfg_video_x = 0;   // LD picture position, LD columns
+static int cfg_video_y = 0;      // ... and lines
 static time_t cfg_mtime = 0;
 
 static const char *root_path(const char *name)
@@ -1330,6 +1332,7 @@ static void load_config()
 	{
 		cfg_mtime = 0;
 		cfg_log_regs = cfg_log_reads = 0;
+		ld_video_set_position(0, 0);
 		return;
 	}
 	if (st.st_mtime == cfg_mtime) return;
@@ -1338,14 +1341,20 @@ static void load_config()
 	FILE *fp = fopen(path, "r");
 	if (!fp) return;
 	cfg_log_regs = cfg_log_reads = 0;
+	cfg_video_x = 0;
+	cfg_video_y = 0;
 	char line[256];
 	int v;
+	double d;
 	while (fgets(line, sizeof(line), fp))
 	{
 		if (sscanf(line, " log_regs %d", &v) == 1) cfg_log_regs = v ? 1 : 0;
 		else if (sscanf(line, " log_reads %d", &v) == 1) cfg_log_reads = v ? 1 : 0;
+		else if (sscanf(line, " video_x %lf", &d) == 1) cfg_video_x = d;
+		else if (sscanf(line, " video_y %d", &v) == 1) cfg_video_y = v;
 	}
 	fclose(fp);
+	ld_video_set_position((int)(cfg_video_x * 256 + (cfg_video_x < 0 ? -0.5 : 0.5)), cfg_video_y);
 	need_apply = 1;
 }
 

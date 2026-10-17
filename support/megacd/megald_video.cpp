@@ -21,12 +21,13 @@
 #define UIO_LD_VSET 0x52
 #define UIO_LD_VGET 0x53
 #define LDV_MAGIC    0x4C44  // reply to UIO_LD_VGET from a core with the LD video player
-#define LDV_VERSION  3       // commit protocol
+#define LDV_VERSION  4       // commit protocol, picture position
 
 #define LDV_OP_CONTROL 0     // word: bit0 enable, bit1 restart, bit2 visible
 #define LDV_OP_PPS     1     // words: {addr[6:0], data[7:0]} ...
 #define LDV_OP_PARAMS  2     // words: frame_words[15:0], frame_words[17:16], field1_row
 #define LDV_OP_COMMIT  3     // word: slot to show next
+#define LDV_OP_POS     4     // words: horizontal offset (1/256 LD column), vertical offset (LD lines)
 
 #define SLOT_BASE  0x30100000u
 #define SLOTS      16
@@ -36,8 +37,6 @@
 // ------------------------------------------------------------------ state
 
 static const ld_disc *vd = NULL;     // disc being shown
-static ld_disc test_disc;
-static int test_mode = 0;
 
 static uint8_t *slot_map = NULL;
 static uint8_t *stage = NULL;
@@ -74,6 +73,7 @@ static int pending_req = -1;
 static int core_ok = 0;
 static int enabled = 0;
 static int visible = 0, sent_visible = -1;
+static int pos_x = 0, pos_y = 0, sent_pos = 0;
 static uint16_t st[7];
 
 // ------------------------------------------------------------- HPS <-> core
@@ -100,6 +100,16 @@ static void send_setup(const ld_disc *d)
 	spi_w((uint16_t)(words >> 16));
 	spi_w((uint16_t)d->field1_row);
 	DisableIO();
+}
+
+static void send_position()
+{
+	spi_uio_cmd_cont(UIO_LD_VSET);
+	spi_w(LDV_OP_POS);
+	spi_w((uint16_t)(int16_t)pos_x);
+	spi_w((uint16_t)(int16_t)pos_y);
+	DisableIO();
+	sent_pos = 1;
 }
 
 static void send_commit(int slot)
@@ -260,6 +270,7 @@ static int start(const ld_disc *d)
 
 	send_control(0, 1, 0);
 	send_setup(d);
+	send_position();
 	send_control(1, 0, 0);
 	enabled = 1;
 	core_ok = 1;
@@ -287,23 +298,17 @@ static void stop()
 
 int ld_video_attach(const ld_disc *d)
 {
-	if (test_mode)
-	{
-		stop();
-		mmi_close(&test_disc);
-		test_mode = 0;
-	}
 	return start(d);
 }
 
 void ld_video_detach()
 {
-	if (!test_mode) stop();
+	stop();
 }
 
 int ld_video_attached()
 {
-	return vd != NULL && !test_mode;
+	return vd != NULL;
 }
 
 int ld_video_request(int frame)
@@ -355,43 +360,20 @@ void ld_video_set_visible(int v)
 	visible = v ? 1 : 0;
 }
 
-void ld_video_open(const char *path)
+void ld_video_set_position(int x, int y)
 {
-	if (vd && !test_mode)
-	{
-		Info("LaserDisc in the drive: eject it first", 3000);
-		return;
-	}
-	stop();
-	mmi_close(&test_disc);
-	test_mode = 0;
-	if (!path || !*path) return;
-
-	char full[1024], err[128];
-	if (path[0] == '/') snprintf(full, sizeof(full), "%s", path);
-	else snprintf(full, sizeof(full), "%s/%s", getRootDir(), path);
-	if (!mmi_open(&test_disc, full, 0, err, sizeof(err)) || !test_disc.has_video)
-	{
-		Info(test_disc.fd < 0 ? err : "LD video: no .dscv video in this file", 3000);
-		mmi_close(&test_disc);
-		return;
-	}
-	if (!start(&test_disc))
-	{
-		Info("LD video: this core can't show it", 3000);
-		mmi_close(&test_disc);
-		return;
-	}
-	test_mode = 1;
-	visible = 1;
-	ld_log("video test: playing %s", full);
+	if (x < -32768) x = -32768;
+	if (x > 32767) x = 32767;
+	if (y < -128) y = -128;
+	if (y > 127) y = 127;
+	if (x != pos_x || y != pos_y) sent_pos = 0;
+	pos_x = x;
+	pos_y = y;
 }
 
 void ld_video_poll()
 {
 	static uint32_t timer = 0, report = 0;
-	static uint32_t test_next = 0;
-	static uint32_t test_frame = 0;
 	if (!vd) return;
 	if (timer && !CheckTimer(timer)) return;
 	timer = GetTimer(2);
@@ -404,20 +386,6 @@ void ld_video_poll()
 	}
 	core_ok = 1;
 
-	// the test plays the stream from frame 0 on this clock
-	if (test_mode)
-	{
-		uint32_t now = GetTimer(0);
-		if (!test_next) { test_next = now; test_frame = 0; }
-		if ((int32_t)(now - test_next) >= 0)
-		{
-			test_next += (test_frame % 3) ? 33 : 34;   // 29.97 Hz on average (33.37 ms)
-			ld_video_request(test_frame);
-			ld_video_predict(test_frame, 1);
-			test_frame = (test_frame + 1) % vd->frame_count;
-		}
-	}
-	else test_next = 0;
 
 	pthread_mutex_lock(&mtx);
 	done += (uint16_t)(st[0] - (uint16_t)done);
@@ -449,6 +417,7 @@ void ld_video_poll()
 	}
 	pthread_mutex_unlock(&mtx);
 
+	if (!sent_pos) send_position();
 	if (visible != sent_visible)
 	{
 		send_control(1, 0, visible);
@@ -458,7 +427,7 @@ void ld_video_poll()
 	if (!report || CheckTimer(report))
 	{
 		report = GetTimer(10000);
-		ld_log("video: %u commits, %u shown, %u repeated ticks, %u skipped, %u decode errors, decode %.1f ms, %u loads, %u read errors%s",
+		ld_log("video: %u commits, %u decoded, %u late, %u skipped, %u decode errors, decode %.1f ms, %u loads, %u read errors%s",
 			pushed, done, st[1], st[5], st[2], st[3] * 256 / 53693.175, loads, read_errors, visible ? "" : ", hidden");
 	}
 }

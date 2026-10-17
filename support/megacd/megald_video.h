@@ -7,9 +7,9 @@
 // Frames live in 16 slots of 512 KB in DDR3 at 0x30100000, which work as a
 // cache: a reader thread loads the frames the player is likely to want next
 // (ld_video_predict), and ld_video_request() commits a frame to the core as
-// soon as its slot holds it. The core shows each commit at its next 29.97 Hz
-// tick (one tick later when it arrives just before one) and keeps the last
-// picture up when nothing new is committed.
+// soon as its slot holds it. The core decodes each commit at once and puts
+// it up at the start of a VDP frame, two VDP frames per picture (see
+// ld_video.sv), and keeps the last picture up when nothing new is committed.
 
 #include <stdint.h>
 
@@ -31,7 +31,8 @@ void ld_video_set_visible(int visible);
 
 void ld_video_poll();                    // call often from the main loop
 
-// OSD "Load LD Video Test": play the file's video on its own, no BIOS needed
-void ld_video_open(const char *path);    // "" stops
+// Fine position of the LD picture under the VDP's: x in 1/256 LD columns,
+// y in LD lines (laseractive.cfg video_x / video_y)
+void ld_video_set_position(int x, int y);
 
 #endif
