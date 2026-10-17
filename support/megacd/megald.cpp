@@ -47,6 +47,7 @@
 #define LD_SET_OP_CONTROL 0
 #define LD_SET_OP_OUTREGS 1
 #define LD_SET_OP_ACK     2
+#define LD_SET_OP_TOC     3
 
 #define LD_LOG_GA_RESET   0x7F5A   // gate-array reset marker in the access log
 
@@ -162,6 +163,7 @@ static struct
 static uint8_t sent_out[32];
 static uint8_t sent_valid[32];
 static int need_apply = 1;
+static int toc_sig_reset = 0;
 static uint32_t pending_events = 0;   // bit n: output reg n set by an event, send it
 
 static void cdd_seek_lba(int lba, bool startPaused)
@@ -1072,12 +1074,45 @@ void ld_mix_audio(int16_t *s, int lba, int have_digital)
 
 // ------------------------------------------------------- output registers
 
+// Outputs 0x11-0x14 for a track-info selection (input 0x05 after ares'
+// decoding). The core answers from a table of these (see upload_toc), except
+// for selections 0x00 and 0xFF (current position), which it takes live.
+static uint8_t toc_reg(int regNum, uint8_t sel)
+{
+	uint8_t flags, minute, second, frame;
+	uint8_t data = 0;
+	if (regNum == 0x11)
+	{
+		if (sel > trackCount()) data = 0;
+		else
+		{
+			int t = sel == 0 ? currentTrack() : sel;
+			getTrackTocData(t, flags, minute, second, frame);
+			data = (flags << 4) | 0x01;
+		}
+		return data;
+	}
+	int k = regNum - 0x12;
+	uint8_t v[3];
+	if (sel == 0xA0 || sel == 0xB0)
+	{
+		v[0] = bcd_enc(firstTrack()); v[1] = bcd_enc(trackCount()); v[2] = 0;
+		return v[k];
+	}
+	if (sel == 0xA1 || sel == 0xB1) msf_from(cdd.DiscEnd() + 150, minute, second, frame);
+	else if ((sel == 0 || sel == 0xFF) && trackCount() > 0) msf_from(cdd.GetLBA() + 150, minute, second, frame);
+	else if (sel > trackCount()) return 0xFF;
+	else getTrackTocData(sel, flags, minute, second, frame);
+	v[0] = minute; v[1] = second; v[2] = frame;
+	return bcd_enc(v[k]);
+}
+
 // MCD::LD::getOutputRegisterValue for the registers this side drives
 static uint8_t getOutputRegisterValue(int regNum)
 {
 	uint8_t previousData = P.outputRegs[regNum];
 	uint8_t data = previousData;
-	uint8_t flags, minute, second, frame;
+	uint8_t minute, second, frame;
 	bool loaded = isDiscLoaded(), ld = isDiscLaserdisc(), clv = isLaserdiscClv();
 	int ds = P.currentDriveState;
 
@@ -1144,47 +1179,11 @@ static uint8_t getOutputRegisterValue(int regNum)
 		data = (data & ~0x13) | (P.operationErrorFlag1 ? 0x10 : 0) | (P.operationErrorFlag2 ? 0x02 : 0) | (P.operationErrorFlag3 ? 0x01 : 0);
 		break;
 	case 0x11:
-		if (P.selectedTrackInfo > trackCount()) data = 0;
-		else
-		{
-			int t = P.selectedTrackInfo == 0 ? currentTrack() : P.selectedTrackInfo;
-			getTrackTocData(t, flags, minute, second, frame);
-			data = (flags << 4) | 0x01;
-		}
-		break;
 	case 0x12:
 	case 0x13:
 	case 0x14:
-	{
-		int k = regNum - 0x12;
-		uint8_t v[3];
-		uint8_t sel = P.selectedTrackInfo;
-		if (sel == 0xA0 || sel == 0xB0)
-		{
-			v[0] = bcd_enc(firstTrack()); v[1] = bcd_enc(trackCount()); v[2] = 0;
-			data = v[k];
-		}
-		else if (sel == 0xA1 || sel == 0xB1)
-		{
-			msf_from(cdd.DiscEnd() + 150, minute, second, frame);
-			v[0] = minute; v[1] = second; v[2] = frame;
-			data = bcd_enc(v[k]);
-		}
-		else if ((sel == 0 || sel == 0xFF) && trackCount() > 0)
-		{
-			msf_from(cdd.GetLBA() + 150, minute, second, frame);
-			v[0] = minute; v[1] = second; v[2] = frame;
-			data = bcd_enc(v[k]);
-		}
-		else if (sel > trackCount()) data = 0xFF;
-		else
-		{
-			getTrackTocData(sel, flags, minute, second, frame);
-			v[0] = minute; v[1] = second; v[2] = frame;
-			data = bcd_enc(v[k]);
-		}
+		data = toc_reg(regNum, P.selectedTrackInfo);
 		break;
-	}
 	case 0x15:
 		if (loaded && ds >= 5) data = bcd_enc(currentTrack());
 		else if (loaded && ds >= 2) data = 0x01;
@@ -1268,6 +1267,22 @@ static void send_ack()
 	spi_uio_cmd_cont(UIO_LD_SET);
 	spi_w(LD_SET_OP_ACK);
 	spi_w(0);
+	DisableIO();
+}
+
+// The whole TOC table (outputs 0x11-0x14 for every input 0x05 value), so
+// the core can answer the BIOS's TOC reads at once.
+static void upload_toc()
+{
+	spi_uio_cmd_cont(UIO_LD_SET);
+	spi_w(LD_SET_OP_TOC);
+	for (int raw = 0; raw < 256; raw++)
+	{
+		uint8_t sel = (raw < 0x99) ? bcd_dec(raw) : raw;
+		spi_w((uint16_t)((raw << 8) | toc_reg(0x11, sel)));
+		spi_w((uint16_t)((toc_reg(0x12, sel) << 8) | toc_reg(0x13, sel)));
+		spi_w((uint16_t)(toc_reg(0x14, sel) << 8));
+	}
 	DisableIO();
 }
 
@@ -1413,6 +1428,7 @@ void ld_poll()
 		need_apply = 0;
 		send_control(1);
 		memset(sent_valid, 0, sizeof(sent_valid));
+		toc_sig_reset = 1;
 		for (int r = 0x1A; r <= 0x1F; r++) pending_events |= 1u << r;
 	}
 
@@ -1449,6 +1465,16 @@ void ld_poll()
 		send_control(1);
 	}
 	if (regs_fp && count) fflush(regs_fp);
+
+	// TOC table: whenever the disc (or its TOC) changes, and after resets
+	static uint32_t toc_sig = 0;
+	if (toc_sig_reset) { toc_sig = 0; toc_sig_reset = 0; }
+	uint32_t sig = 1 + (cdd.loaded ? 1 : 0) + (uint32_t)trackCount() * 2 + (uint32_t)cdd.DiscEnd() * 256;
+	if (sig != toc_sig)
+	{
+		toc_sig = sig;
+		upload_toc();
+	}
 
 	update_outputs();
 	if (pend) send_ack();
