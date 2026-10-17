@@ -12,6 +12,7 @@
 #include "../../cheats.h"
 #include "megacd.h"
 #include "megald.h"
+#include "megald_video.h"
 
 #define SAVE_IO_INDEX 5 // fake download to trigger save loading
 
@@ -86,6 +87,7 @@ void mcd_poll()
 		DisableIO();
 
 	ld_poll();
+	ld_video_poll();
 }
 
 static char buf[1024];
@@ -123,7 +125,12 @@ void mcd_set_image(int num, const char *filename)
 {
 	static char last_dir[1024] = {};
 
-	(void)num;
+	// S1: LaserActive video test (.dscmmi), separate from the CD drive
+	if (num == 1)
+	{
+		ld_video_open(filename);
+		return;
+	}
 
 	cdd.Unload();
 	cdd.status = CD_STAT_OPEN;
