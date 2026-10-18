@@ -325,7 +325,7 @@ char is_minimig()
 static int is_megacd_type = 0;
 char is_megacd()
 {
-	if (!is_megacd_type) is_megacd_type = strcasecmp(orig_name, "MEGACD") ? 2 : 1;
+	if (!is_megacd_type) is_megacd_type = (strcasecmp(orig_name, "MEGACD") && strcasecmp(orig_name, "MEGALD")) ? 2 : 1;   // MegaLD: the LaserActive build
 	return (is_megacd_type == 1);
 }
 
