@@ -104,6 +104,7 @@ private:
 	int ParseCUE(char *toc_text, const char *cue_name, int in_archive);
 	int OpenTrackFile(fileTYPE *f, const char *name, int in_archive);
 	void LDUpdate();
+	void LDStartReadAhead();
 	int LoadCHD(const char* filename);
 	int SectorSend(uint8_t* header);
 	int SubcodeSend();

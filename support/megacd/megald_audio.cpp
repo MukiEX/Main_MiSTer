@@ -1,4 +1,4 @@
-// LaserActive: read-ahead for the disc's audio. See megald_audio.h.
+// LaserActive: read-ahead for the disc's audio and data. See megald_audio.h.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,16 +16,17 @@
 
 #define SECTOR   2352
 #define CH       32          // sectors per chunk (0.43 s)
-#define NCH      16          // chunks kept (6.8 s, 2.4 MB)
-#define AHEAD    150         // sectors to keep read ahead at normal speed (2 s)
+#define NCH      32          // chunks kept (13.7 s, 7.2 MB)
+#define AHEAD    300         // sectors to keep read ahead at normal speed (4 s)
 
 struct chunk
 {
 	int id;                  // (lba + 150) / CH, or -1
 	int state;               // 0 empty, 1 loading, 2 ready
 	uint32_t used;
-	uint8_t dig_ok[CH], ana_ok[CH];
+	uint8_t dig_ok[CH], ana_ok[CH], dat_ok[CH];
 	uint8_t dig[CH][SECTOR], ana[CH][SECTOR];
+	uint8_t dat[CH * SECTOR];  // data track sectors at its own stride
 };
 
 static chunk *chunks;
@@ -35,7 +36,7 @@ static pthread_t reader;
 static int running, stop_req;
 static int src_fd = -1;
 static std::vector<ld_audio_seg> dig_segs;
-static ld_audio_seg ana_seg;
+static ld_audio_seg ana_seg, dat_seg;
 static int want_id = -1, want_dir = 1;
 static uint32_t lru_clock;
 static ld_audio_stats_t stats;
@@ -77,7 +78,7 @@ static bool read_at(int fd, uint8_t *b, size_t len, uint64_t off)
 	return true;
 }
 
-// sectors [l0, l0 + n) of one source into buf (n * SECTOR bytes), ok[] per sector
+// sectors [l0, l0 + n) of one source into buf (n sectors at the source's stride), ok[] per sector
 static void read_source(int fd, const ld_audio_seg *segs, size_t nsegs, int l0, int n, uint8_t *buf, uint8_t *ok)
 {
 	memset(ok, 0, n);
@@ -86,7 +87,8 @@ static void read_source(int fd, const ld_audio_seg *segs, size_t nsegs, int l0, 
 		int a = l0 > segs[i].start ? l0 : segs[i].start;
 		int b = l0 + n < segs[i].end ? l0 + n : segs[i].end;
 		if (a >= b) continue;
-		if (read_at(fd, buf + (size_t)(a - l0) * SECTOR, (size_t)(b - a) * SECTOR, segs[i].off + (uint64_t)(a - segs[i].start) * SECTOR))
+		size_t st = segs[i].stride;
+		if (read_at(fd, buf + (size_t)(a - l0) * st, (size_t)(b - a) * st, segs[i].off + (uint64_t)(a - segs[i].start) * st))
 			memset(ok + (a - l0), 1, b - a);
 		else
 			stats.read_errors++;
@@ -177,6 +179,7 @@ static void *reader_thread(void *)
 		int l0 = id * CH - 150;
 		read_source(src_fd, dig_segs.data(), dig_segs.size(), l0, CH, &c->dig[0][0], c->dig_ok);
 		read_source(src_fd, &ana_seg, 1, l0, CH, &c->ana[0][0], c->ana_ok);
+		read_source(src_fd, &dat_seg, 1, l0, CH, c->dat, c->dat_ok);
 
 		pthread_mutex_lock(&mtx);
 		c->state = 2;
@@ -203,7 +206,7 @@ void ld_audio_stop()
 	if (chunks) for (int i = 0; i < NCH; i++) chunks[i].id = -1, chunks[i].state = 0;
 }
 
-void ld_audio_start(int fd, const std::vector<ld_audio_seg> &digital, const ld_audio_seg &analog)
+void ld_audio_start(int fd, const std::vector<ld_audio_seg> &digital, const ld_audio_seg &analog, const ld_audio_seg &data)
 {
 	ld_audio_stop();
 	if (!chunks) chunks = (chunk *)calloc(NCH, sizeof(chunk));
@@ -212,6 +215,7 @@ void ld_audio_start(int fd, const std::vector<ld_audio_seg> &digital, const ld_a
 	src_fd = fd;
 	dig_segs = digital;
 	ana_seg = analog;
+	dat_seg = data;
 	want_id = -1;
 	want_dir = 1;
 	memset(&stats, 0, sizeof(stats));
@@ -259,6 +263,47 @@ void ld_audio_get(int lba, int dir, int16_t *digital, int *have_digital, int16_t
 	if (event_ok())
 		ld_log("audio: read-ahead miss at lba %d (chunk %s, %ld ms after the last seek), read directly in %lu ms",
 			lba, state == 1 ? "still loading" : "not started", ld_ms_since_seek(), took);
+}
+
+int ld_audio_get_data(int lba, int dir, uint8_t *out)
+{
+	if (src_fd < 0 || lba < dat_seg.start || lba >= dat_seg.end) return 0;
+	int id = chunk_of(lba);
+	if (id < 0) return 0;
+
+	pthread_mutex_lock(&mtx);
+	if (id != want_id || dir != want_dir)
+	{
+		want_id = id;
+		want_dir = dir;
+		pthread_cond_signal(&cond);
+	}
+	chunk *c = running ? find(id) : NULL;
+	if (c && c->state == 2)
+	{
+		int k = lba + 150 - id * CH;
+		c->used = ++lru_clock;
+		int ok = c->dat_ok[k];
+		if (ok) memcpy(out, c->dat + (size_t)k * dat_seg.stride + dat_seg.skip, 2048);
+		pthread_mutex_unlock(&mtx);
+		if (ok) return 1;
+	}
+	else
+	{
+		stats.misses++;
+		pthread_mutex_unlock(&mtx);
+	}
+
+	// not read yet: this sector directly
+	unsigned long t0 = GetTimer(0);
+	static uint8_t sec[SECTOR];
+	uint8_t ok;
+	read_source(src_fd, &dat_seg, 1, lba, 1, sec, &ok);
+	if (ok) memcpy(out, sec + dat_seg.skip, 2048);
+	unsigned long took = GetTimer(0) - t0;
+	if (event_ok())
+		ld_log("audio: read-ahead miss at lba %d (data, %ld ms after the last seek), read directly in %lu ms", lba, ld_ms_since_seek(), took);
+	return ok;
 }
 
 void ld_audio_idle() { sent_idle = 1; }

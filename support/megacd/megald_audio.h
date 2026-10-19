@@ -7,7 +7,7 @@
 // ~15 ms of the FIFO asking for it. Reading each sector from the SD card at
 // that moment stalls behind the video reader's frame reads now and then, and
 // the FIFO runs dry (a click). This keeps the source audio (the digital
-// track's audio sectors and the analog soundtrack) read a couple of seconds
+// track's audio and data sectors and the analog soundtrack) read ~4 seconds
 // ahead of the playing position, in big sequential reads on its own thread,
 // so the drive tick only copies from memory. Mixing (faders, channel
 // selection) still happens at the tick, so commands take effect at once.
@@ -17,11 +17,16 @@
 
 struct ld_audio_seg
 {
-	int start, end;   // LBAs [start, end) with audio here
-	uint64_t off;     // archive offset of LBA start's 2352 bytes
+	int start, end;   // LBAs [start, end) with this source here
+	uint64_t off;     // archive offset of LBA start's sector
+	int stride;       // bytes per sector in the file (2352, or 2048 for a cooked data track)
+	int skip;         // data tracks: where the 2048 user bytes start in a sector
 };
 
-void ld_audio_start(int fd, const std::vector<ld_audio_seg> &digital, const ld_audio_seg &analog);
+// digital: the audio tracks; analog: the soundtrack; data: the data track
+// (start == end if none). The data track is read ahead too: Mega-LD games
+// read program data all along the disc, and those reads stalled the drive.
+void ld_audio_start(int fd, const std::vector<ld_audio_seg> &digital, const ld_audio_seg &analog, const ld_audio_seg &data);
 void ld_audio_stop();
 
 // One sector (588 stereo samples) of each source. dir is the way the disc is
@@ -35,6 +40,10 @@ void ld_audio_get(int lba, int dir, int16_t *digital, int *have_digital, int16_t
 // and logged (at most 20 events per 10 s, with the time since the last seek).
 void ld_audio_sent(unsigned long ms, int lba);
 void ld_audio_idle();   // not playing (stopped, paused, seeking): the next gap doesn't count
+
+// The data track's 2048 user bytes for a sector; 0 if the read-ahead has no
+// data track there (the caller reads it as before).
+int ld_audio_get_data(int lba, int dir, uint8_t *out);
 
 struct ld_audio_stats_t { uint32_t sectors, misses, chunk_loads, read_errors, late, worst_gap; };
 void ld_audio_stats(ld_audio_stats_t *s);

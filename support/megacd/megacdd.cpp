@@ -295,21 +295,6 @@ int cdd_t::Load(const char *filename)
 		ld_mode = 1;
 		ld_dir = 1;
 
-		// where each audio track's sectors are in the archive, for the read-ahead
-		std::vector<ld_audio_seg> segs;
-		for (int i = 0; i < this->toc.last; i++)
-		{
-			auto &t = this->toc.tracks[i];
-			if (t.type || !t.f.opened()) continue;
-			int a = t.start, b = t.end;
-			int lo = (t.offset + 2351) / 2352;                       // first LBA inside the file
-			int hi = (int)((t.f.size + t.offset) / 2352);           // end of the file's whole sectors
-			if (a < lo) a = lo;
-			if (b > hi) b = hi;
-			if (a >= b) continue;
-			segs.push_back({ a, b, (uint64_t)(t.f.base + (__off64_t)a * 2352 - t.offset) });
-		}
-		ld_audio_attach(segs);
 	} else if (!strncasecmp(".cue", ext, 4))
 	{
 		ld_disc_unmount();
@@ -361,6 +346,8 @@ int cdd_t::Load(const char *filename)
 	}
 
 	printf("\x1b[32mMCD: Sector size = %u, Track 0 end = %u\n\x1b[0m", this->sectorSize, this->toc.tracks[0].end);
+
+	if (this->ld_mode) LDStartReadAhead();
 
 	if (this->toc.last)
 	{
@@ -603,6 +590,38 @@ void cdd_t::LDStop()
 
 // Between drive ticks: top the CD audio FIFO up as soon as it has room, so a
 // late tick doesn't let it run dry (it holds only ~29 ms).
+// Where the disc's audio tracks and data track are in the archive, for the
+// read-ahead (megald_audio.cpp).
+void cdd_t::LDStartReadAhead()
+{
+	std::vector<ld_audio_seg> segs;
+	ld_audio_seg data = { 0, 0, 0, 2352, 0 };
+	for (int i = 0; i < this->toc.last; i++)
+	{
+		auto &t = this->toc.tracks[i];
+		if (!t.f.opened()) continue;
+		if (t.type)
+		{
+			// as ReadData reads it: track 0's file, from LBA 0, at sectorSize
+			if (i != 0 || !this->sectorSize) continue;
+			int ss = this->sectorSize;
+			int b = t.end;
+			int hi = (int)(t.f.size / ss);
+			if (b > hi) b = hi;
+			if (b > 0) data = { 0, b, (uint64_t)t.f.base, ss, ss == 2048 ? 0 : 16 };
+			continue;
+		}
+		int a = t.start, b = t.end;
+		int lo = (t.offset + 2351) / 2352;                       // first LBA inside the file
+		int hi = (int)((t.f.size + t.offset) / 2352);           // end of the file's whole sectors
+		if (a < lo) a = lo;
+		if (b > hi) b = hi;
+		if (a >= b) continue;
+		segs.push_back({ a, b, (uint64_t)(t.f.base + (__off64_t)a * 2352 - t.offset), 2352, 0 });
+	}
+	ld_audio_attach(segs, data);
+}
+
 void cdd_t::LDTopUp()
 {
 	if (!this->ld_mode) return;
@@ -1116,6 +1135,8 @@ void cdd_t::ReadData(uint8_t *buf)
 
 			mister_chd_read_sector(this->toc.chd_f, this->lba + this->toc.tracks[0].offset, 0, read_offset, 2048, buf, this->chd_hunkbuf, &this->chd_hunknum);
 		} else {
+			// LaserDisc: from the read-ahead, so the drive tick never waits on the card
+			if (this->ld_mode && ld_audio_get_data(this->lba, this->ld_dir, buf)) return;
 			if (this->sectorSize == 2048)
 			{
 				FileSeek(&this->toc.tracks[0].f, this->lba * 2048, SEEK_SET);

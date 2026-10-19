@@ -1402,10 +1402,10 @@ const ld_disc *ld_disc_mount(const char *path)
 
 // The drive's digital audio, as the CD drive found it in the cue sheet, plus
 // the analog soundtrack (aligned with the video: lead-in frames come first).
-void ld_audio_attach(const std::vector<ld_audio_seg> &digital)
+void ld_audio_attach(const std::vector<ld_audio_seg> &digital, const ld_audio_seg &data)
 {
 	if (!disc_ok) return;
-	ld_audio_seg a = { -150, -150, 0 };
+	ld_audio_seg a = { -150, -150, 0, 2352, 0 };
 	if (disc.audio_size)
 	{
 		uint32_t leading = (uint32_t)((double)disc.lead_in * (44100.0 / videoFramesPerSecond));
@@ -1413,7 +1413,7 @@ void ld_audio_attach(const std::vector<ld_audio_seg> &digital)
 		a.off = disc.audio_off + lead;
 		if (disc.audio_size > lead) a.end = -150 + (int)((disc.audio_size - lead) / 2352);
 	}
-	ld_audio_start(disc.fd, digital, a);
+	ld_audio_start(disc.fd, digital, a, data);
 }
 
 void ld_disc_unmount()

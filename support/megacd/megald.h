@@ -32,6 +32,6 @@ const ld_disc *ld_get_disc();                     // NULL if none
 int  ld_sector_advance();                         // sectors to move (may be 0 or negative)
 void ld_sector_reached(int lba, int end_of_disc);
 void ld_mix_audio(int16_t *sector, const int16_t *analog, int have_digital, int have_analog);  // 588 stereo samples, in place
-void ld_audio_attach(const std::vector<ld_audio_seg> &digital);  // after the cue sheet is parsed
+void ld_audio_attach(const std::vector<ld_audio_seg> &digital, const ld_audio_seg &data);  // after the cue sheet is parsed
 
 #endif
