@@ -13,6 +13,8 @@
 // the analog audio in, and commits video frames (megald_video.cpp).
 
 #include <stdint.h>
+#include <vector>
+#include "megald_audio.h"
 
 struct ld_disc;
 
@@ -28,6 +30,7 @@ const ld_disc *ld_get_disc();                     // NULL if none
 // CD drive hooks, called once per sector tick while a LaserDisc plays
 int  ld_sector_advance();                         // sectors to move (may be 0 or negative)
 void ld_sector_reached(int lba, int end_of_disc);
-void ld_mix_audio(int16_t *sector, int lba, int have_digital);  // 588 stereo samples, in place
+void ld_mix_audio(int16_t *sector, const int16_t *analog, int have_digital, int have_analog);  // 588 stereo samples, in place
+void ld_audio_attach(const std::vector<ld_audio_seg> &digital);  // after the cue sheet is parsed
 
 #endif

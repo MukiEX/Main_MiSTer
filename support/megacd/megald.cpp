@@ -1023,25 +1023,15 @@ void ld_sector_reached(int lba, int end_of_disc)
 
 static int16_t clamp16(int v) { return (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v); }
 
-void ld_mix_audio(int16_t *s, int lba, int have_digital)
+void ld_mix_audio(int16_t *s, const int16_t *analog, int have_digital, int have_analog)
 {
-	static int16_t analog[588 * 2];
 	const uint8_t *in = P.inputRegs;
 	int analogMixingMode = in[0x01] >> 6;
 	int audioMixingInputSelection = in[0x0D] >> 6;
 	bool digitalAudioMixingDisabled = analogMixingMode > 0 && (audioMixingInputSelection == 2 || (analogMixingMode == 1 && bit(in[0x0D], 4)));
 	bool digitalAudioAttenuationDisabled = analogMixingMode == 0 || audioMixingInputSelection == 3;
 	bool analogAudioMixingDisabled = analogMixingMode == 0 || (analogMixingMode == 1 && !bit(in[0x0D], 4));
-
-	// analog audio for this sector (aligned with the video: lead-in frames come first)
-	bool have_analog = false;
-	if (!analogAudioMixingDisabled && disc_ok && disc.audio_size)
-	{
-		uint32_t leading = (uint32_t)((double)disc.lead_in * (44100.0 / videoFramesPerSecond));
-		int64_t pos = (int64_t)(lba + 150) * 2352 + (int64_t)leading * 4;
-		if (pos >= 0 && (uint64_t)pos + sizeof(analog) <= disc.audio_size)
-			have_analog = mmi_read(&disc, analog, sizeof(analog), disc.audio_off + pos);
-	}
+	if (analogAudioMixingDisabled) have_analog = 0;
 
 	float digitalFader = (float)in[0x0F] / 255.0f;
 	int volL = P.analogAudioFadeToMutedLeft ? 0 : 0x100 - P.analogAudioAttenuationLeft;
@@ -1406,9 +1396,26 @@ const ld_disc *ld_disc_mount(const char *path)
 	return &disc;
 }
 
+// The drive's digital audio, as the CD drive found it in the cue sheet, plus
+// the analog soundtrack (aligned with the video: lead-in frames come first).
+void ld_audio_attach(const std::vector<ld_audio_seg> &digital)
+{
+	if (!disc_ok) return;
+	ld_audio_seg a = { -150, -150, 0 };
+	if (disc.audio_size)
+	{
+		uint32_t leading = (uint32_t)((double)disc.lead_in * (44100.0 / videoFramesPerSecond));
+		uint64_t lead = (uint64_t)leading * 4;
+		a.off = disc.audio_off + lead;
+		if (disc.audio_size > lead) a.end = -150 + (int)((disc.audio_size - lead) / 2352);
+	}
+	ld_audio_start(disc.fd, digital, a);
+}
+
 void ld_disc_unmount()
 {
 	if (!disc_ok) return;
+	ld_audio_stop();
 	ld_video_detach();
 	mmi_close(&disc);
 	disc_ok = 0;
@@ -1484,7 +1491,28 @@ void ld_poll()
 		ld_log("PD6103A log overflowed: commands were lost");
 		send_control(1);
 	}
-	if (regs_fp && count) fflush(regs_fp);
+	// the register log is a debugging aid: flush it once a second, not every
+	// millisecond, so its writes don't hold up the card's reads
+	static uint32_t regs_flush = 0;
+	if (regs_fp && (!regs_flush || CheckTimer(regs_flush)))
+	{
+		regs_flush = GetTimer(1000);
+		fflush(regs_fp);
+	}
+
+	// audio read-ahead: a line every 10 s while the disc plays
+	static uint32_t audio_report = 0;
+	static uint32_t audio_last = 0;
+	if (disc_ok && (!audio_report || CheckTimer(audio_report)))
+	{
+		audio_report = GetTimer(10000);
+		ld_audio_stats_t a;
+		ld_audio_stats(&a);
+		if (a.sectors != audio_last)
+			ld_log("audio: %u sectors, %u read directly (seek/start), %u chunk loads, %u read errors, %u late (FIFO ran dry), longest gap %u ms",
+				a.sectors, a.misses, a.chunk_loads, a.read_errors, a.late, a.worst_gap);
+		audio_last = a.sectors;
+	}
 
 	// TOC table: whenever the disc (or its TOC) changes, and after resets
 	static uint32_t toc_sig = 0;

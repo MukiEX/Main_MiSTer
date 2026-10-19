@@ -56,6 +56,15 @@ void mcd_poll()
 		cdd.Update();
 	}
 
+	// LaserDisc: refill the CD audio FIFO between drive ticks too (it holds
+	// only ~29 ms, and a tick can come late while Main is busy)
+	static uint32_t topup_timer = 0;
+	if (cdd.ld_mode && (!topup_timer || CheckTimer(topup_timer)))
+	{
+		topup_timer = GetTimer(2);
+		cdd.LDTopUp();
+	}
+
 
 	uint8_t req = spi_uio_cmd_cont(UIO_CD_GET);
 	if (req != last_req)

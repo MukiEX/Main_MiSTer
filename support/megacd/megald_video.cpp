@@ -6,6 +6,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "../../user_io.h"
 #include "../../file_io.h"
@@ -201,11 +202,16 @@ static void *reader_thread(void *)
 		}
 
 		uint32_t n = (d->frame_bytes + 7) & ~7u;
-		if (!mmi_read(d, stage, d->frame_bytes, d->frames_off + (uint64_t)f * d->frame_stride))
+		uint64_t off = d->frames_off + (uint64_t)f * d->frame_stride;
+		if (!mmi_read(d, stage, d->frame_bytes, off))
 		{
 			read_errors++;
 			memset(stage, 0, n);
 		}
+		// the slots are the cache: drop the frame from Linux's page cache, or
+		// at 12-16 MB/s it fills memory within a minute and every read after
+		// that waits on evicting old pages (the audio's reads with it)
+		posix_fadvise(d->fd, (off_t)off, (off_t)d->frame_bytes, POSIX_FADV_DONTNEED);
 		memcpy(slot_map + (size_t)s * SLOT_SIZE, stage, n);
 		__sync_synchronize();
 

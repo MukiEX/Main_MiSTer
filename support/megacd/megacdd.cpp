@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <time.h>
 
+#include "../../hardware.h"
 #include "megacd.h"
 #include "megald.h"
 #include "megald_mmi.h"
@@ -27,6 +28,7 @@ cdd_t::cdd_t() {
 	SendData = NULL;
 	CanSendData = NULL;
 	ld_mode = 0;
+	ld_dir = 1;
 
 	stat[0] = 0xB;
 	stat[1] = 0x0;
@@ -291,6 +293,23 @@ int cdd_t::Load(const char *filename)
 			return (-1);
 		}
 		ld_mode = 1;
+		ld_dir = 1;
+
+		// where each audio track's sectors are in the archive, for the read-ahead
+		std::vector<ld_audio_seg> segs;
+		for (int i = 0; i < this->toc.last; i++)
+		{
+			auto &t = this->toc.tracks[i];
+			if (t.type || !t.f.opened()) continue;
+			int a = t.start, b = t.end;
+			int lo = (t.offset + 2351) / 2352;                       // first LBA inside the file
+			int hi = (int)((t.f.size + t.offset) / 2352);           // end of the file's whole sectors
+			if (a < lo) a = lo;
+			if (b > hi) b = hi;
+			if (a >= b) continue;
+			segs.push_back({ a, b, (uint64_t)(t.f.base + (__off64_t)a * 2352 - t.offset) });
+		}
+		ld_audio_attach(segs);
 	} else if (!strncasecmp(".cue", ext, 4))
 	{
 		ld_disc_unmount();
@@ -582,6 +601,15 @@ void cdd_t::LDStop()
 	this->isData = 1;
 }
 
+// Between drive ticks: top the CD audio FIFO up as soon as it has room, so a
+// late tick doesn't let it run dry (it holds only ~29 ms).
+void cdd_t::LDTopUp()
+{
+	if (!this->ld_mode) return;
+	if (this->status == CD_STAT_PLAY && this->latency == 0) LDUpdate();
+	else ld_audio_idle();
+}
+
 void cdd_t::LDOpenTray()
 {
 	this->status = CD_STAT_OPEN;
@@ -626,19 +654,20 @@ void cdd_t::LDUpdate()
 		SectorSend(header);
 	}
 
-	static uint8_t audio[2352];
-	int have_digital = 0;
-	memset(audio, 0, sizeof(audio));
-	if (!data && this->lba >= this->toc.tracks[this->index].start && this->toc.tracks[this->index].f.opened())
-	{
-		FileSeek(&this->toc.tracks[this->index].f, (__off64_t)this->lba * 2352 - this->toc.tracks[this->index].offset, SEEK_SET);
-		have_digital = FileReadAdv(&this->toc.tracks[this->index].f, audio, 2352) == 2352;
-		if (!have_digital) memset(audio, 0, sizeof(audio));
-	}
-	ld_mix_audio((int16_t *)audio, this->lba, have_digital);
-	if (SendData) SendData(audio, 2352, MCD_CDDA_IO_INDEX);
+	// both audio sources come from the read-ahead (megald_audio.cpp); a data
+	// sector has no digital audio, but the analog soundtrack plays over it
+	static int16_t audio[588 * 2], analog[588 * 2];
+	int have_digital = 0, have_analog = 0;
+	ld_audio_get(this->lba, this->ld_dir, audio, &have_digital, analog, &have_analog);
+	if (data || this->lba < this->toc.tracks[this->index].start) have_digital = 0;
+	if (!have_digital) memset(audio, 0, sizeof(audio));
+	ld_mix_audio(audio, analog, have_digital, have_analog);
+	if (SendData) SendData((uint8_t *)audio, 2352, MCD_CDDA_IO_INDEX);
+	ld_audio_sent(GetTimer(0));
 
-	int next = this->lba + ld_sector_advance();
+	int adv = ld_sector_advance();
+	this->ld_dir = adv;
+	int next = this->lba + adv;
 	if (next < -150) next = -150;
 	if (next >= this->toc.end)
 	{

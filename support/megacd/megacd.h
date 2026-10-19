@@ -57,6 +57,7 @@ public:
 	// player (megald.cpp) decides how far each sector tick moves and mixes
 	// the analog audio into the CD audio stream.
 	int ld_mode;
+	int ld_dir;          // last sector advance (way the disc is moving)
 
 	cdd_t();
 	int Load(const char *filename);
@@ -81,6 +82,7 @@ public:
 	void LDPause();
 	void LDStop();
 	void LDOpenTray();
+	void LDTopUp();                                   // between ticks: refill the CD audio FIFO
 	int LDSeeking() { return latency > 0 && (status == CD_STAT_PLAY || status == CD_STAT_SEEK); }
 	int LDPlaying() { return status == CD_STAT_PLAY && latency == 0; }
 
