@@ -9,6 +9,8 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "../../hardware.h"
+#include "megald.h"
 #include "megald_audio.h"
 
 #define SECTOR   2352
@@ -36,6 +38,24 @@ static ld_audio_seg ana_seg;
 static int want_id = -1, want_dir = 1;
 static uint32_t lru_clock;
 static ld_audio_stats_t stats;
+
+// per-event lines in laseractive.log, at most EVENTS per 10 s
+#define EVENTS 20
+static int event_ok()
+{
+	static unsigned long window;
+	static int n, dropped;
+	unsigned long now = GetTimer(0);
+	if (now - window >= 10000)
+	{
+		if (dropped) ld_log("audio: (%d more events not logged)", dropped);
+		window = now;
+		n = dropped = 0;
+	}
+	if (n < EVENTS) { n++; return 1; }
+	dropped++;
+	return 0;
+}
 static int sent_idle = 1;     // next ld_audio_sent's gap doesn't count
 
 static int chunk_of(int lba) { return lba < -150 ? -1 : (lba + 150) / CH; }
@@ -206,19 +226,25 @@ void ld_audio_get(int lba, int dir, int16_t *digital, int *have_digital, int16_t
 		return;
 	}
 	stats.misses++;
+	int state = c ? c->state : 0;
 	pthread_mutex_unlock(&mtx);
 
 	// not read yet (just started or seeked): read this sector directly
+	unsigned long t0 = GetTimer(0);
 	uint8_t ok;
 	read_source(src_fd, dig_segs.data(), dig_segs.size(), lba, 1, (uint8_t *)digital, &ok);
 	*have_digital = ok;
 	read_source(src_fd, &ana_seg, 1, lba, 1, (uint8_t *)analog, &ok);
 	*have_analog = ok;
+	unsigned long took = GetTimer(0) - t0;
+	if (event_ok())
+		ld_log("audio: read-ahead miss at lba %d (chunk %s, %ld ms after the last seek), read directly in %lu ms",
+			lba, state == 1 ? "still loading" : "not started", ld_ms_since_seek(), took);
 }
 
 void ld_audio_idle() { sent_idle = 1; }
 
-void ld_audio_sent(unsigned long ms)
+void ld_audio_sent(unsigned long ms, int lba)
 {
 	static unsigned long last;
 	unsigned long gap = ms - last;
@@ -228,6 +254,8 @@ void ld_audio_sent(unsigned long ms)
 	if (gap > 29) stats.late++;
 	if (gap > stats.worst_gap) stats.worst_gap = gap;
 	pthread_mutex_unlock(&mtx);
+	if (gap > 29 && event_ok())
+		ld_log("audio: FIFO ran dry at lba %d: %lu ms since the last sector (%ld ms after the last seek)", lba, gap, ld_ms_since_seek());
 }
 
 void ld_audio_stats(ld_audio_stats_t *s)

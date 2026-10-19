@@ -31,8 +31,9 @@ void ld_audio_stop();
 void ld_audio_get(int lba, int dir, int16_t *digital, int *have_digital, int16_t *analog, int *have_analog);
 
 // Called when a sector of audio goes to the core (time in ms). A gap of more
-// than 29 ms (the FIFO's whole depth) means the core ran out: counted as late.
-void ld_audio_sent(unsigned long ms);
+// than 29 ms (the FIFO's whole depth) means the core ran out: counted as late
+// and logged (at most 20 events per 10 s, with the time since the last seek).
+void ld_audio_sent(unsigned long ms, int lba);
 void ld_audio_idle();   // not playing (stopped, paused, seeking): the next gap doesn't count
 
 struct ld_audio_stats_t { uint32_t sectors, misses, chunk_loads, read_errors, late, worst_gap; };

@@ -110,6 +110,9 @@ static ld_disc disc;
 static int disc_ok = 0;
 static int disc_has_video = 0;
 
+static unsigned long last_seek_ms;
+long ld_ms_since_seek() { return last_seek_ms ? (long)(GetTimer(0) - last_seek_ms) : -1; }
+
 const ld_disc *ld_get_disc() { return disc_ok ? &disc : NULL; }
 
 // ----------------------------------------------------------- player state
@@ -817,6 +820,7 @@ static void performSeekWithLatchedState()
 	P.seekPerformedSinceLastFrameUpdate = true;
 	P.seekWaitRequest = -2;
 
+	last_seek_ms = GetTimer(0);
 	int aba = current_aba();
 	ld_log("seek (mode %d): lba %d -> %d, frame %d%s", P.activeSeekMode, before, cdd.GetLBA(),
 		zeroBasedFrameIndexFromABA(aba, true) + 1, paused ? ", paused" : "");

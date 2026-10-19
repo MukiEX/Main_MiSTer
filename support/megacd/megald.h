@@ -20,6 +20,7 @@ struct ld_disc;
 
 void ld_poll();
 void ld_reset();                                  // core reset (full player power-on)
+long ld_ms_since_seek();                          // -1 before the first seek
 void ld_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));  // <root>/laseractive.log
 
 // LaserDisc image, used by the CD drive (megacdd.cpp)

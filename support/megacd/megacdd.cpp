@@ -663,7 +663,7 @@ void cdd_t::LDUpdate()
 	if (!have_digital) memset(audio, 0, sizeof(audio));
 	ld_mix_audio(audio, analog, have_digital, have_analog);
 	if (SendData) SendData((uint8_t *)audio, 2352, MCD_CDDA_IO_INDEX);
-	ld_audio_sent(GetTimer(0));
+	ld_audio_sent(GetTimer(0), this->lba);
 
 	int adv = ld_sector_advance();
 	this->ld_dir = adv;
