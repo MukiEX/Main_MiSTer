@@ -5,6 +5,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -179,6 +180,24 @@ static bool pick_job(int &frame, int &slot)
 	return false;
 }
 
+// Main runs on core 1 (core 0 takes Linux's interrupts), and threads inherit
+// that. This reader's copies into uncached DDR are heavy enough to hold the
+// main loop up for a time slice now and then, so it runs on core 0, as Main's
+// offload worker does.
+static int start_on_core0(pthread_t *t, void *(*fn)(void *))
+{
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(0, &set);
+	pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
+	int r = pthread_create(t, &attr, fn, NULL);
+	pthread_attr_destroy(&attr);
+	if (r) r = pthread_create(t, NULL, fn, NULL);   // affinity refused: run anywhere
+	return r;
+}
+
 static void *reader_thread(void *)
 {
 	while (!reader_stop)
@@ -283,7 +302,7 @@ static int start(const ld_disc *d)
 	visible = 0;
 	sent_visible = 0;
 
-	if (pthread_create(&reader, NULL, reader_thread, NULL) == 0) reader_running = 1;
+	if (start_on_core0(&reader, reader_thread) == 0) reader_running = 1;
 	unsigned bpp16 = ((d->pps[4] & 3) << 8) | d->pps[5];
 	ld_log("video: %u frames, %u bytes per frame (%.4g bpp)", d->frame_count, d->frame_bytes, bpp16 / 16.0);
 	return 1;
