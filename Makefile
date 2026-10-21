@@ -55,6 +55,9 @@ LFLAGS	= -lc -lstdc++ -lm -lrt $(IMLIB2_LIB) -Llib/bluetooth -lbluetooth -lpthre
 
 OUTPUT_FILTER = sed -e 's/\(.[a-zA-Z]\+\):\([0-9]\+\):\([0-9]\+\):/\1(\2,\ \3):/g'
 
+# unwind tables so a LaserActive crash report can show a backtrace
+CFLAGS += -funwind-tables
+
 ifneq ($(DEBUG),1)
 	CFLAGS += -O3
 else

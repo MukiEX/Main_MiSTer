@@ -42,6 +42,7 @@
 #include "frame_timer.h"
 #include "scaler.h"
 #include "support.h"
+#include "support/megacd/megald.h"
 
 static char core_path[1024] = {};
 static char rbf_path[1024] = {};
@@ -329,6 +330,13 @@ char is_megacd()
 	return (is_megacd_type == 1);
 }
 
+static int is_megald_type = 0;
+char is_megald()
+{
+	if (!is_megald_type) is_megald_type = strcasecmp(orig_name, "MEGALD") ? 2 : 1;
+	return (is_megald_type == 1);
+}
+
 static int is_pce_type = 0;
 char is_pce()
 {
@@ -486,6 +494,7 @@ void user_io_read_core_name()
 	is_neogeo_type = 0;
 	is_minimig_type = 0;
 	is_megacd_type = 0;
+	is_megald_type = 0;
 	is_pce_type = 0;
 	is_archie_type = 0;
 	is_gba_type = 0;
@@ -1672,7 +1681,13 @@ void user_io_init(const char *path, const char *xml)
 					if (is_cdi()) cdi_load_root_nvram();
 					if (is_marty()) marty_init();
 
-					if (!strlen(path) || !user_io_file_tx(path, 0, 0, 0, 1))
+					if (is_megald())
+					{
+						// LaserActive: the Sega PAC boot ROM the OSD asks for (megald_bios.cpp)
+						ld_bios_forget();
+						ld_bios_load("", 0, 0);
+					}
+					else if (!strlen(path) || !user_io_file_tx(path, 0, 0, 0, 1))
 					{
 						if (!is_cpc())
 						{

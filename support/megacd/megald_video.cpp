@@ -200,6 +200,7 @@ static int start_on_core0(pthread_t *t, void *(*fn)(void *))
 
 static void *reader_thread(void *)
 {
+	pthread_setname_np(pthread_self(), "ld-frames");
 	while (!reader_stop)
 	{
 		int f, s;

@@ -157,6 +157,7 @@ static int start_on_core0(pthread_t *t, void *(*fn)(void *))
 
 static void *reader_thread(void *)
 {
+	pthread_setname_np(pthread_self(), "ld-readahead");
 	pthread_mutex_lock(&mtx);
 	while (!stop_req)
 	{
@@ -263,6 +264,17 @@ void ld_audio_get(int lba, int dir, int16_t *digital, int *have_digital, int16_t
 	if (event_ok())
 		ld_log("audio: read-ahead miss at lba %d (chunk %s, %ld ms after the last seek), read directly in %lu ms",
 			lba, state == 1 ? "still loading" : "not started", ld_ms_since_seek(), took);
+}
+
+void ld_audio_prefetch(int lba)
+{
+	int id = chunk_of(lba);
+	if (id < 0 || src_fd < 0) return;
+	pthread_mutex_lock(&mtx);
+	want_id = id;
+	want_dir = 1;
+	pthread_cond_signal(&cond);
+	pthread_mutex_unlock(&mtx);
 }
 
 int ld_audio_get_data(int lba, int dir, uint8_t *out)

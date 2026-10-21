@@ -76,6 +76,7 @@ public:
 	int TrackEnd(int i) { return toc.tracks[i].end; }
 	int TrackIsData(int i) { return toc.tracks[i].type ? 1 : 0; }
 	int DiscEnd() { return toc.end; }
+	int DiscRegion();                                 // header regions: bit 0 J, 1 U, 2 E (0 unknown)
 	int TrackOfLBA(int l) { return toc.GetTrackByLBA(l); }
 	void LDSeek(int lba, int play);                   // paused seek ends in PAUSE
 	void LDPlay();

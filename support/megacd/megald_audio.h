@@ -45,6 +45,10 @@ void ld_audio_idle();   // not playing (stopped, paused, seeking): the next gap 
 // data track there (the caller reads it as before).
 int ld_audio_get_data(int lba, int dir, uint8_t *out);
 
+// A seek is under way to this LBA: start reading there now, while the
+// drive "seeks", so the first sectors after it are already in memory.
+void ld_audio_prefetch(int lba);
+
 struct ld_audio_stats_t { uint32_t sectors, misses, chunk_loads, read_errors, late, worst_gap; };
 void ld_audio_stats(ld_audio_stats_t *s);
 

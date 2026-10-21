@@ -98,6 +98,7 @@ void mcd_poll()
 
 	ld_poll();
 	ld_video_poll();
+	if (is_megald()) ld_bios_poll();
 }
 
 static char buf[1024];
@@ -145,6 +146,39 @@ void mcd_set_image(int num, const char *filename)
 	strcpy(last_dir, filename);
 	char *p = strrchr(last_dir, '/');
 	if (p) *p = 0;
+
+	// LaserActive: the disc decides which Sega PAC BIOS runs, so it's loaded
+	// first and the BIOS after it (megald_bios.cpp)
+	if (is_megald())
+	{
+		if (!same_game)
+		{
+			mcd_mount_save("");
+			user_io_status_set("[0]", 1);
+			user_io_status_set("[0]", 0);
+			mcd_reset();
+		}
+		int ok = *filename && cdd.Load(filename) > 0;
+		if (!ld_bios_load(ok ? filename : "", ok ? cdd.DiscRegion() : 0, same_game)) ok = 0;
+		if (ok)
+		{
+			cdd.status = cdd.loaded ? CD_STAT_STOP : CD_STAT_NO_DISC;
+			cdd.latency = 10;
+			cdd.SendData = mcd_send_data;
+			cdd.CanSendData = mcd_can_send_data;
+			if (!same_game)
+			{
+				mcd_load_rom(filename, "cart.rom", 1);
+				mcd_mount_save(filename);
+				cheats_init(filename, 0);
+			}
+		}
+		else if (*filename)
+		{
+			cdd.status = CD_STAT_NO_DISC;
+		}
+		return;
+	}
 
 	int loaded = 1;
 	if (!same_game)

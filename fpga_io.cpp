@@ -22,6 +22,7 @@
 #include "fpga_system_manager.h"
 #include "fpga_reset_manager.h"
 #include "fpga_nic301.h"
+#include "support/megacd/megald.h"
 
 #define FPGA_REG_BASE 0xFF000000
 #define FPGA_REG_SIZE 0x01000000
@@ -629,6 +630,11 @@ void app_restart(const char *path, const char *xml, const char *exe)
 
 	const char *appname = exe ? exe : getappname();
 	printf("restarting to %s\n", appname);
+	{
+		char note[1200];
+		snprintf(note, sizeof(note), "MiSTer_LD is restarting into %s (core %s)", appname, path ? path : "");
+		ld_log_if_open(note);
+	}
 
 	//a cleaner way to re-start
 	pid_t child = fork();
@@ -642,6 +648,7 @@ void app_restart(const char *path, const char *xml, const char *exe)
 	}
 
 	printf("Something went wrong. Rebooting...\n");
+	ld_log_if_open("MiSTer_LD couldn't restart; rebooting");
 	reboot(1);
 	_exit(1);
 }

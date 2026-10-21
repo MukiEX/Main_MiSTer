@@ -74,20 +74,43 @@ static const char *root_path(const char *name)
 	return path;
 }
 
+static void log_line(const char *text)
+{
+	char line[1100];
+	snprintf(line, sizeof(line), "%8.3f  %s", GetTimer(0) / 1000.0, text);
+	fputs(line, log_fp);
+	fputc('\n', log_fp);
+	fflush(log_fp);
+	ld_crash_note(line);
+}
+
 void ld_log(const char *fmt, ...)
 {
 	if (!log_fp)
 	{
+		// keep the previous run's log (it may show why that run ended)
+		char old_path[1100];
+		snprintf(old_path, sizeof(old_path), "%s.1", root_path(LD_LOG_FILE));
+		rename(root_path(LD_LOG_FILE), old_path);
 		log_fp = fopen(root_path(LD_LOG_FILE), "w");
 		if (!log_fp) return;
 	}
-	fprintf(log_fp, "%8.3f  ", GetTimer(0) / 1000.0);
+	char text[1024];
 	va_list ap;
 	va_start(ap, fmt);
-	vfprintf(log_fp, fmt, ap);
+	vsnprintf(text, sizeof(text), fmt, ap);
 	va_end(ap);
-	fputc('\n', log_fp);
-	fflush(log_fp);
+	log_line(text);
+}
+
+void ld_log_if_open(const char *text)
+{
+	if (log_fp) log_line(text);
+}
+
+void ld_crash_setup()
+{
+	ld_crash_install(root_path("laseractive_crash.log"));
 }
 
 // ------------------------------------------------------------------ helpers
@@ -821,6 +844,7 @@ static void performSeekWithLatchedState()
 	P.seekWaitRequest = -2;
 
 	last_seek_ms = GetTimer(0);
+	ld_audio_prefetch(cdd.GetLBA());
 	int aba = current_aba();
 	ld_log("seek (mode %d): lba %d -> %d, frame %d%s", P.activeSeekMode, before, cdd.GetLBA(),
 		zeroBasedFrameIndexFromABA(aba, true) + 1, paused ? ", paused" : "");

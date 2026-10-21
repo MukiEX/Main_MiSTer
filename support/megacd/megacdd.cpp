@@ -629,6 +629,33 @@ void cdd_t::LDTopUp()
 	else ld_audio_idle();
 }
 
+// The regions in the disc's header (the first data sector, 0x1F0): bit 0 J,
+// bit 1 U, bit 2 E; 0 if there's no data track or no region letters.
+int cdd_t::DiscRegion()
+{
+	if (!this->loaded || !this->toc.last || !this->toc.tracks[0].type) return 0;
+	uint8_t b[0x200];
+	memset(b, 0, sizeof(b));
+	int skip = this->sectorSize == 2048 ? 0 : 16;
+	if (this->toc.chd_f)
+	{
+		if (mister_chd_read_sector(this->toc.chd_f, this->toc.tracks[0].offset, 0, skip, sizeof(b), b, this->chd_hunkbuf, &this->chd_hunknum) != CHDERR_NONE) return 0;
+	}
+	else
+	{
+		if (!this->toc.tracks[0].f.opened() || !FileSeek(&this->toc.tracks[0].f, skip, SEEK_SET)) return 0;
+		if (FileReadAdv(&this->toc.tracks[0].f, b, sizeof(b)) != (int)sizeof(b)) return 0;
+	}
+	int r = 0;
+	for (int i = 0x1F0; i < 0x1F3; i++)
+	{
+		if (b[i] == 'J') r |= 1;
+		else if (b[i] == 'U') r |= 2;
+		else if (b[i] == 'E') r |= 4;
+	}
+	return r;
+}
+
 void cdd_t::LDOpenTray()
 {
 	this->status = CD_STAT_OPEN;

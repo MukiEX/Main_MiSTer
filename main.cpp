@@ -34,6 +34,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "scheduler.h"
 #include "osd.h"
 #include "offload.h"
+#include "support/megacd/megald.h"
 
 const char *version = "$VER:" VDATE;
 
@@ -70,6 +71,7 @@ int main(int argc, char *argv[])
 	}
 
 	FindStorage();
+	ld_crash_setup();   // LaserActive: crash reports in laseractive_crash.log
 	user_io_init((argc > 1) ? argv[1] : "",(argc > 2) ? argv[2] : NULL);
 
 #ifdef USE_SCHEDULER
