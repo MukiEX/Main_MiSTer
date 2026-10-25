@@ -1147,8 +1147,24 @@ void cdd_t::SeekToLBA(int lba, int play) {
 
 }
 
+// LaserActive log_sectors: where the last data sector came from
+// (1 read-ahead, 2 read-ahead miss, 3 plain file read; 0 none)
+static int ld_data_src;
+
+static uint32_t sector_crc(const uint8_t *p, int n)
+{
+	static uint32_t t[256];
+	if (!t[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1))); t[i] = c; }
+	uint32_t c = 0xFFFFFFFFu;
+	while (n--) c = t[(c ^ *p++) & 0xFF] ^ (c >> 8);
+	return ~c;
+}
+
 void cdd_t::ReadData(uint8_t *buf)
 {
+	// the pregap before LBA 0 (seeks land a few sectors early): blank, as on a
+	// pressed disc, rather than whatever was on the stack
+	if (this->lba < 0) memset(buf, 0, 2048);
 	if (this->toc.tracks[this->index].type && (this->lba >= 0))
 	{
 
@@ -1163,7 +1179,9 @@ void cdd_t::ReadData(uint8_t *buf)
 			mister_chd_read_sector(this->toc.chd_f, this->lba + this->toc.tracks[0].offset, 0, read_offset, 2048, buf, this->chd_hunkbuf, &this->chd_hunknum);
 		} else {
 			// LaserDisc: from the read-ahead, so the drive tick never waits on the card
-			if (this->ld_mode && ld_audio_get_data(this->lba, this->ld_dir, buf)) return;
+			ld_data_src = 0;
+			if (this->ld_mode && (ld_data_src = ld_audio_get_data(this->lba, this->ld_dir, buf))) return;
+			ld_data_src = 3;
 			if (this->sectorSize == 2048)
 			{
 				FileSeek(&this->toc.tracks[0].f, this->lba * 2048, SEEK_SET);
@@ -1265,7 +1283,22 @@ int cdd_t::SectorSend(uint8_t* header)
 
 	if (header) {
 		memcpy(buf + 12, header, 4);
+		ld_data_src = 0;
 		ReadData(buf + 16);
+		if (this->ld_mode && ld_log_sectors())
+		{
+			// one line per data sector the core is given: which, where from,
+			// a CRC of its 2048 bytes (to check against the image), and the
+			// time since the previous one
+			static unsigned long last_ms;
+			unsigned long now = GetTimer(0);
+			static const char *src[] = { "nothing (no data track here)", "read-ahead", "read-ahead MISS", "file" };
+			const char *from = this->lba < 0 ? "the pregap (blank)" : src[ld_data_src & 3];
+			ld_log("sector: lba %d, header %02X:%02X:%02X mode %02X, from %s, crc %08X, %lu ms after the previous",
+				this->lba, header[0], header[1], header[2], header[3], from,
+				ld_data_src ? sector_crc(buf + 16, 2048) : 0, last_ms ? now - last_ms : 0);
+			last_ms = now;
+		}
 	}
 	else {
 		index = MCD_CDDA_IO_INDEX;

@@ -30,6 +30,9 @@
 #include <inttypes.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
 
 #include "../../file_io.h"
 #include "../../user_io.h"
@@ -74,13 +77,123 @@ static const char *root_path(const char *name)
 	return path;
 }
 
+// The logs are written by their own thread ("ld-log", on core 0). Writing
+// from the main loop meant every line waited on the SD card, and with
+// log_regs/log_reads on that held the drive tick up long enough to starve the
+// audio FIFO and change the very timing being logged. Now a line is only
+// copied into a queue here; if the queue ever fills, lines are dropped and
+// counted, never waited for.
+
+#define LQ_SLOTS 4096
+#define LQ_LEN   320
+
+struct lq_slot { uint8_t file; char text[LQ_LEN]; };
+static lq_slot lq[LQ_SLOTS];
+static unsigned lq_head, lq_tail;          // head: next to write; tail: next free
+static unsigned lq_dropped;
+static pthread_mutex_t lq_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t lq_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t lq_write_mtx = PTHREAD_MUTEX_INITIALIZER;   // one writer at a time
+static pthread_t lq_thread;
+static int lq_started;
+
+static int cfg_log_sectors = 0;
+
+static void lq_write_batch()
+{
+	static lq_slot batch[256];
+	for (;;)
+	{
+		pthread_mutex_lock(&lq_mtx);
+		unsigned n = 0, dropped = lq_dropped;
+		lq_dropped = 0;
+		while (lq_head != lq_tail && n < 256) batch[n++] = lq[lq_head++ % LQ_SLOTS];
+		pthread_mutex_unlock(&lq_mtx);
+		if (!n && !dropped) return;
+		for (unsigned i = 0; i < n; i++)
+		{
+			FILE *fp = batch[i].file ? regs_fp : log_fp;
+			if (fp) { fputs(batch[i].text, fp); fputc('\n', fp); }
+		}
+		if (dropped && log_fp) fprintf(log_fp, "%8.3f  log: %u lines were dropped (the card fell behind)\n", GetTimer(0) / 1000.0, dropped);
+		if (n < 256) break;
+	}
+	if (log_fp) fflush(log_fp);
+	if (regs_fp) fflush(regs_fp);
+}
+
+static void *lq_thread_fn(void *)
+{
+	pthread_setname_np(pthread_self(), "ld-log");
+	for (;;)
+	{
+		pthread_mutex_lock(&lq_mtx);
+		if (lq_head == lq_tail && !lq_dropped)
+		{
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += 250 * 1000000L;
+			if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+			pthread_cond_timedwait(&lq_cond, &lq_mtx, &ts);
+		}
+		pthread_mutex_unlock(&lq_mtx);
+		pthread_mutex_lock(&lq_write_mtx);
+		lq_write_batch();
+		pthread_mutex_unlock(&lq_write_mtx);
+	}
+	return NULL;
+}
+
+static void lq_start()
+{
+	if (lq_started) return;
+	lq_started = 1;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(0, &set);
+	pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
+	if (pthread_create(&lq_thread, &attr, lq_thread_fn, NULL) && pthread_create(&lq_thread, NULL, lq_thread_fn, NULL))
+		lq_started = 0;   // no thread: lines are written where they're logged
+	pthread_attr_destroy(&attr);
+}
+
+// file 0: laseractive.log, 1: the PD6103A log. text is already timestamped.
+static void lq_push(int file, const char *text)
+{
+	if (!lq_started)
+	{
+		FILE *fp = file ? regs_fp : log_fp;
+		if (fp) { fputs(text, fp); fputc('\n', fp); fflush(fp); }
+		return;
+	}
+	pthread_mutex_lock(&lq_mtx);
+	if (lq_tail - lq_head >= LQ_SLOTS) lq_dropped++;
+	else
+	{
+		lq_slot &s = lq[lq_tail++ % LQ_SLOTS];
+		s.file = (uint8_t)file;
+		snprintf(s.text, LQ_LEN, "%s", text);
+		// wake the writer for the main log, or when the register log piles up
+		if (!file || lq_tail - lq_head > LQ_SLOTS / 4) pthread_cond_signal(&lq_cond);
+	}
+	pthread_mutex_unlock(&lq_mtx);
+}
+
+// Everything queued, on the disk now (exit, restart).
+static void lq_flush_now()
+{
+	pthread_mutex_lock(&lq_write_mtx);
+	lq_write_batch();
+	pthread_mutex_unlock(&lq_write_mtx);
+}
+
 static void log_line(const char *text)
 {
 	char line[1100];
 	snprintf(line, sizeof(line), "%8.3f  %s", GetTimer(0) / 1000.0, text);
-	fputs(line, log_fp);
-	fputc('\n', log_fp);
-	fflush(log_fp);
+	lq_push(0, line);
 	ld_crash_note(line);
 }
 
@@ -94,6 +207,7 @@ void ld_log(const char *fmt, ...)
 		rename(root_path(LD_LOG_FILE), old_path);
 		log_fp = fopen(root_path(LD_LOG_FILE), "w");
 		if (!log_fp) return;
+		lq_start();
 	}
 	char text[1024];
 	va_list ap;
@@ -103,10 +217,15 @@ void ld_log(const char *fmt, ...)
 	log_line(text);
 }
 
+// The last words of a run (exit, restart): written out before returning.
 void ld_log_if_open(const char *text)
 {
-	if (log_fp) log_line(text);
+	if (!log_fp) return;
+	log_line(text);
+	lq_flush_now();
 }
+
+int ld_log_sectors() { return cfg_log_sectors; }
 
 void ld_crash_setup()
 {
@@ -1349,7 +1468,7 @@ static void load_config()
 	if (stat(path, &st) != 0)
 	{
 		cfg_mtime = 0;
-		cfg_log_regs = cfg_log_reads = 0;
+		cfg_log_regs = cfg_log_reads = cfg_log_sectors = 0;
 		ld_video_set_position(0, 0);
 		return;
 	}
@@ -1358,7 +1477,7 @@ static void load_config()
 
 	FILE *fp = fopen(path, "r");
 	if (!fp) return;
-	cfg_log_regs = cfg_log_reads = 0;
+	cfg_log_regs = cfg_log_reads = cfg_log_sectors = 0;
 	cfg_video_x = 0;
 	cfg_video_y = 0;
 	char line[256];
@@ -1368,6 +1487,7 @@ static void load_config()
 	{
 		if (sscanf(line, " log_regs %d", &v) == 1) cfg_log_regs = v ? 1 : 0;
 		else if (sscanf(line, " log_reads %d", &v) == 1) cfg_log_reads = v ? 1 : 0;
+		else if (sscanf(line, " log_sectors %d", &v) == 1) cfg_log_sectors = v ? 1 : 0;
 		else if (sscanf(line, " video_x %lf", &d) == 1) cfg_video_x = d;
 		else if (sscanf(line, " video_y %d", &v) == 1) cfg_video_y = v;
 	}
@@ -1383,15 +1503,18 @@ static void log_entry(uint16_t e)
 	{
 		regs_fp = fopen(root_path(LD_REGS_FILE), "w");
 		if (!regs_fp) return;
+		lq_start();
 	}
+	char line[96];
 	if (e == LD_LOG_GA_RESET)
+		snprintf(line, sizeof(line), "%8.3f  -- gate-array reset --", GetTimer(0) / 1000.0);
+	else
 	{
-		fprintf(regs_fp, "%8.3f  -- gate-array reset --\n", GetTimer(0) / 1000.0);
-		return;
+		int is_read = (e >> 15) & 1, is_out = (e >> 14) & 1, reg = (e >> 9) & 0x1F, alt = (e >> 8) & 1;
+		snprintf(line, sizeof(line), "%8.3f  %c %s %02X = %02X%s", GetTimer(0) / 1000.0, is_read ? 'R' : 'W', is_out ? "out" : "in ", reg, e & 0xFF,
+			(is_read && alt) ? "  (snapshot/held)" : "");
 	}
-	int is_read = (e >> 15) & 1, is_out = (e >> 14) & 1, reg = (e >> 9) & 0x1F, alt = (e >> 8) & 1;
-	fprintf(regs_fp, "%8.3f  %c %s %02X = %02X%s\n", GetTimer(0) / 1000.0, is_read ? 'R' : 'W', is_out ? "out" : "in ", reg, e & 0xFF,
-		(is_read && alt) ? "  (snapshot/held)" : "");
+	lq_push(1, line);
 }
 
 // ------------------------------------------------------------------ public
@@ -1519,15 +1642,6 @@ void ld_poll()
 		ld_log("PD6103A log overflowed: commands were lost");
 		send_control(1);
 	}
-	// the register log is a debugging aid: flush it once a second, not every
-	// millisecond, so its writes don't hold up the card's reads
-	static uint32_t regs_flush = 0;
-	if (regs_fp && (!regs_flush || CheckTimer(regs_flush)))
-	{
-		regs_flush = GetTimer(1000);
-		fflush(regs_fp);
-	}
-
 	// audio read-ahead: a line every 10 s while the disc plays
 	static uint32_t audio_report = 0;
 	static uint32_t audio_last = 0;

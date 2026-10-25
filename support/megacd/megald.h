@@ -22,7 +22,8 @@ void ld_poll();
 void ld_reset();                                  // core reset (full player power-on)
 long ld_ms_since_seek();                          // -1 before the first seek
 void ld_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));  // <root>/laseractive.log (the previous one becomes .1)
-void ld_log_if_open(const char *text);            // only if this run has started a log
+void ld_log_if_open(const char *text);            // only if this run has started a log; written out at once
+int  ld_log_sectors();                            // laseractive.cfg log_sectors: log each data sector sent
 
 // Crash reports (megald_crash.cpp): <root>/laseractive_crash.log
 void ld_crash_setup();                            // once, at start-up

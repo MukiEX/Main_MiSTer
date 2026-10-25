@@ -315,7 +315,7 @@ int ld_audio_get_data(int lba, int dir, uint8_t *out)
 	unsigned long took = GetTimer(0) - t0;
 	if (event_ok())
 		ld_log("audio: read-ahead miss at lba %d (data, %ld ms after the last seek), read directly in %lu ms", lba, ld_ms_since_seek(), took);
-	return ok;
+	return ok ? 2 : 0;
 }
 
 void ld_audio_idle() { sent_idle = 1; }

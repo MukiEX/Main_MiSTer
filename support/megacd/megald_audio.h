@@ -41,8 +41,9 @@ void ld_audio_get(int lba, int dir, int16_t *digital, int *have_digital, int16_t
 void ld_audio_sent(unsigned long ms, int lba);
 void ld_audio_idle();   // not playing (stopped, paused, seeking): the next gap doesn't count
 
-// The data track's 2048 user bytes for a sector; 0 if the read-ahead has no
-// data track there (the caller reads it as before).
+// The data track's 2048 user bytes for a sector: 1 from the read-ahead, 2
+// read from the card just now (a miss); 0 if the read-ahead has no data
+// track there (the caller reads it as before).
 int ld_audio_get_data(int lba, int dir, uint8_t *out);
 
 // A seek is under way to this LBA: start reading there now, while the
