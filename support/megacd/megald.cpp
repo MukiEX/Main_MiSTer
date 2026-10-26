@@ -58,6 +58,8 @@
 #define LD_REGS_FILE "laseractive_pd6103a.log"
 #define LD_CFG_FILE  "laseractive.cfg"
 
+extern const char *version;   // main.cpp
+
 static const double videoFramesPerSecond = 30.0 / 1.001;
 
 // ------------------------------------------------------------------ logging
@@ -212,6 +214,10 @@ void ld_log(const char *fmt, ...)
 		log_fp = fopen(root_path(LD_LOG_FILE), "w");
 		if (!log_fp) return;
 		lq_start();
+		// which build this is, so a log from a stale binary is obvious
+		char id[200];
+		snprintf(id, sizeof(id), "MiSTer_LD %s, built %s %s (log options: log_regs, log_reads, log_sectors, log_cpu)", version + 5, __DATE__, __TIME__);
+		log_line(id);
 	}
 	char text[1024];
 	va_list ap;
