@@ -1396,17 +1396,22 @@ static const uint8_t driven_regs[] = { 0x02, 0x03, 0x04, 0x06, 0x07, 0x08, 0x09,
 // paused for one poll, so the log empties and the ack lands.
 static int reads_paused = 0;
 
-// log_cpu: the core samples the sub CPU about 100 times a second (the last
-// instruction fetch and the last data access) and puts each sample in the
-// log as 7 entries tagged as writes with bit 8 set (rtl/MCD/PD6103A.vhd).
+// log_cpu: the core samples the sub and main CPUs about 100 times a second
+// (the last instruction fetch and the last data access) and puts each
+// sample in the log as 14 entries tagged as writes with bit 8 set
+// (rtl/MCD/PD6103A.vhd).
 // They're summed up here once a second: where the CPU spends its time, and
 // what it keeps reading, which is what a hang is waiting on.
 struct probe_count { uint32_t key; uint32_t n; };
-static probe_count probe_pc[48], probe_da[48];
-static int probe_npc, probe_nda;
-static uint32_t probe_samples, probe_nofetch, probe_halted, probe_reset;
-static uint8_t probe_bytes[7];
-static uint8_t probe_ipl;
+struct probe_cpu
+{
+	probe_count pc[48], da[48];
+	int npc, nda;
+	uint32_t samples, nofetch, halted, reset;
+	uint8_t ipl;
+};
+static probe_cpu probes[2];   // 0: sub CPU, 1: main CPU
+static uint8_t probe_bytes[14];
 
 static void probe_add(probe_count *t, int &n, uint32_t key)
 {
@@ -1422,42 +1427,49 @@ static int probe_cmp(const void *a, const void *b)
 
 static void probe_report()
 {
-	if (!probe_samples) return;
-	char line[1000];
-	int n = snprintf(line, sizeof(line), "sub CPU, %u samples:", probe_samples);
-	qsort(probe_pc, probe_npc, sizeof(probe_count), probe_cmp);
-	qsort(probe_da, probe_nda, sizeof(probe_count), probe_cmp);
-	n += snprintf(line + n, sizeof(line) - n, " fetching at");
-	for (int i = 0; i < probe_npc && i < 8; i++)
-		n += snprintf(line + n, sizeof(line) - n, " %06X x%u", probe_pc[i].key, probe_pc[i].n);
-	n += snprintf(line + n, sizeof(line) - n, "; data");
-	for (int i = 0; i < probe_nda && i < 6; i++)
-		n += snprintf(line + n, sizeof(line) - n, " %c %06X x%u", (probe_da[i].key >> 24) ? 'R' : 'W', probe_da[i].key & 0xFFFFFF, probe_da[i].n);
-	n += snprintf(line + n, sizeof(line) - n, "; IPL %d", 7 - probe_ipl);
-	if (probe_nofetch) n += snprintf(line + n, sizeof(line) - n, "; no fetch in %u (stopped, or off the bus)", probe_nofetch);
-	if (probe_halted) n += snprintf(line + n, sizeof(line) - n, "; halted in %u", probe_halted);
-	if (probe_reset) n += snprintf(line + n, sizeof(line) - n, "; in reset in %u", probe_reset);
-	ld_log("%s", line);
-	probe_npc = probe_nda = 0;
-	probe_samples = probe_nofetch = probe_halted = probe_reset = 0;
+	for (int c = 0; c < 2; c++)
+	{
+		probe_cpu &p = probes[c];
+		if (!p.samples) continue;
+		char line[1000];
+		int n = snprintf(line, sizeof(line), "%s CPU, %u samples:", c ? "main" : "sub", p.samples);
+		qsort(p.pc, p.npc, sizeof(probe_count), probe_cmp);
+		qsort(p.da, p.nda, sizeof(probe_count), probe_cmp);
+		n += snprintf(line + n, sizeof(line) - n, " fetching at");
+		for (int i = 0; i < p.npc && i < 8; i++)
+			n += snprintf(line + n, sizeof(line) - n, " %06X x%u", p.pc[i].key, p.pc[i].n);
+		n += snprintf(line + n, sizeof(line) - n, "; data");
+		for (int i = 0; i < p.nda && i < 6; i++)
+			n += snprintf(line + n, sizeof(line) - n, " %c %06X x%u", (p.da[i].key >> 24) ? 'R' : 'W', p.da[i].key & 0xFFFFFF, p.da[i].n);
+		n += snprintf(line + n, sizeof(line) - n, "; IPL %d", 7 - p.ipl);
+		if (p.nofetch) n += snprintf(line + n, sizeof(line) - n, "; no fetch in %u (stopped, or off the bus)", p.nofetch);
+		if (p.halted) n += snprintf(line + n, sizeof(line) - n, "; halted in %u", p.halted);
+		if (p.reset) n += snprintf(line + n, sizeof(line) - n, "; in reset in %u", p.reset);
+		ld_log("%s", line);
+		p.npc = p.nda = 0;
+		p.samples = p.nofetch = p.halted = p.reset = 0;
+	}
 }
 
+// registers 0x10-0x16: a sub-CPU sample, 0x17-0x1D: a main-CPU one
 static void probe_entry(uint16_t e)
 {
 	int r = (e >> 9) & 0x1F;
-	if (r < 0x10 || r > 0x16) return;
+	if (r < 0x10 || r > 0x1D) return;
 	probe_bytes[r - 0x10] = (uint8_t)e;
-	if (r != 0x16) return;
-	uint8_t st = probe_bytes[6];
-	uint32_t pc = (probe_bytes[0] << 16) | (probe_bytes[1] << 8) | probe_bytes[2];
-	uint32_t da = (probe_bytes[3] << 16) | (probe_bytes[4] << 8) | probe_bytes[5];
-	probe_samples++;
-	if (st & 1) probe_add(probe_pc, probe_npc, pc);
-	else probe_nofetch++;
-	probe_add(probe_da, probe_nda, da | ((st & 0x40) ? 0x1000000u : 0));
-	if (!(st & 2)) probe_reset++;
-	if (!(st & 4)) probe_halted++;
-	probe_ipl = (st >> 3) & 7;
+	if (r != 0x16 && r != 0x1D) return;
+	const uint8_t *b = probe_bytes + (r == 0x1D ? 7 : 0);
+	probe_cpu &p = probes[r == 0x1D ? 1 : 0];
+	uint8_t st = b[6];
+	uint32_t pc = (b[0] << 16) | (b[1] << 8) | b[2];
+	uint32_t da = (b[3] << 16) | (b[4] << 8) | b[5];
+	p.samples++;
+	if (st & 1) probe_add(p.pc, p.npc, pc);
+	else p.nofetch++;
+	probe_add(p.da, p.nda, da | ((st & 0x40) ? 0x1000000u : 0));
+	if (!(st & 2)) p.reset++;
+	if (!(st & 4)) p.halted++;
+	p.ipl = (st >> 3) & 7;
 }
 
 static void send_control(int clear_ovf)
