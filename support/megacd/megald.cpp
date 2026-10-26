@@ -66,6 +66,7 @@ static FILE *log_fp = NULL;
 static FILE *regs_fp = NULL;
 static int cfg_log_regs = 0;
 static int cfg_log_reads = 0;
+static int cfg_log_cpu = 0;     // the core's sub-CPU probe, summed up in laseractive.log
 static double cfg_video_x = 0;   // LD picture position, LD columns
 static int cfg_video_y = 0;      // ... and lines
 static time_t cfg_mtime = 0;
@@ -1395,11 +1396,75 @@ static const uint8_t driven_regs[] = { 0x02, 0x03, 0x04, 0x06, 0x07, 0x08, 0x09,
 // paused for one poll, so the log empties and the ack lands.
 static int reads_paused = 0;
 
+// log_cpu: the core samples the sub CPU about 100 times a second (the last
+// instruction fetch and the last data access) and puts each sample in the
+// log as 7 entries tagged as writes with bit 8 set (rtl/MCD/PD6103A.vhd).
+// They're summed up here once a second: where the CPU spends its time, and
+// what it keeps reading, which is what a hang is waiting on.
+struct probe_count { uint32_t key; uint32_t n; };
+static probe_count probe_pc[48], probe_da[48];
+static int probe_npc, probe_nda;
+static uint32_t probe_samples, probe_nofetch, probe_halted, probe_reset;
+static uint8_t probe_bytes[7];
+static uint8_t probe_ipl;
+
+static void probe_add(probe_count *t, int &n, uint32_t key)
+{
+	for (int i = 0; i < n; i++) if (t[i].key == key) { t[i].n++; return; }
+	if (n < 48) { t[n].key = key; t[n].n = 1; n++; }
+	else t[47].n++;   // the rest, lumped in with the last one
+}
+
+static int probe_cmp(const void *a, const void *b)
+{
+	return (int)((const probe_count *)b)->n - (int)((const probe_count *)a)->n;
+}
+
+static void probe_report()
+{
+	if (!probe_samples) return;
+	char line[1000];
+	int n = snprintf(line, sizeof(line), "sub CPU, %u samples:", probe_samples);
+	qsort(probe_pc, probe_npc, sizeof(probe_count), probe_cmp);
+	qsort(probe_da, probe_nda, sizeof(probe_count), probe_cmp);
+	n += snprintf(line + n, sizeof(line) - n, " fetching at");
+	for (int i = 0; i < probe_npc && i < 8; i++)
+		n += snprintf(line + n, sizeof(line) - n, " %06X x%u", probe_pc[i].key, probe_pc[i].n);
+	n += snprintf(line + n, sizeof(line) - n, "; data");
+	for (int i = 0; i < probe_nda && i < 6; i++)
+		n += snprintf(line + n, sizeof(line) - n, " %c %06X x%u", (probe_da[i].key >> 24) ? 'R' : 'W', probe_da[i].key & 0xFFFFFF, probe_da[i].n);
+	n += snprintf(line + n, sizeof(line) - n, "; IPL %d", 7 - probe_ipl);
+	if (probe_nofetch) n += snprintf(line + n, sizeof(line) - n, "; no fetch in %u (stopped, or off the bus)", probe_nofetch);
+	if (probe_halted) n += snprintf(line + n, sizeof(line) - n, "; halted in %u", probe_halted);
+	if (probe_reset) n += snprintf(line + n, sizeof(line) - n, "; in reset in %u", probe_reset);
+	ld_log("%s", line);
+	probe_npc = probe_nda = 0;
+	probe_samples = probe_nofetch = probe_halted = probe_reset = 0;
+}
+
+static void probe_entry(uint16_t e)
+{
+	int r = (e >> 9) & 0x1F;
+	if (r < 0x10 || r > 0x16) return;
+	probe_bytes[r - 0x10] = (uint8_t)e;
+	if (r != 0x16) return;
+	uint8_t st = probe_bytes[6];
+	uint32_t pc = (probe_bytes[0] << 16) | (probe_bytes[1] << 8) | probe_bytes[2];
+	uint32_t da = (probe_bytes[3] << 16) | (probe_bytes[4] << 8) | probe_bytes[5];
+	probe_samples++;
+	if (st & 1) probe_add(probe_pc, probe_npc, pc);
+	else probe_nofetch++;
+	probe_add(probe_da, probe_nda, da | ((st & 0x40) ? 0x1000000u : 0));
+	if (!(st & 2)) probe_reset++;
+	if (!(st & 4)) probe_halted++;
+	probe_ipl = (st >> 3) & 7;
+}
+
 static void send_control(int clear_ovf)
 {
 	spi_uio_cmd_cont(UIO_LD_SET);
 	spi_w(LD_SET_OP_CONTROL);
-	spi_w(((cfg_log_reads && !reads_paused) ? 1 : 0) | (clear_ovf ? 2 : 0));
+	spi_w(((cfg_log_reads && !reads_paused) ? 1 : 0) | (clear_ovf ? 2 : 0) | ((cfg_log_cpu && !reads_paused) ? 4 : 0));
 	DisableIO();
 }
 
@@ -1479,7 +1544,7 @@ static void load_config()
 	if (stat(path, &st) != 0)
 	{
 		cfg_mtime = 0;
-		cfg_log_regs = cfg_log_reads = cfg_log_sectors = 0;
+		cfg_log_regs = cfg_log_reads = cfg_log_sectors = cfg_log_cpu = 0;
 		ld_video_set_position(0, 0);
 		return;
 	}
@@ -1488,7 +1553,7 @@ static void load_config()
 
 	FILE *fp = fopen(path, "r");
 	if (!fp) return;
-	cfg_log_regs = cfg_log_reads = cfg_log_sectors = 0;
+	cfg_log_regs = cfg_log_reads = cfg_log_sectors = cfg_log_cpu = 0;
 	cfg_video_x = 0;
 	cfg_video_y = 0;
 	char line[256];
@@ -1499,6 +1564,7 @@ static void load_config()
 		if (sscanf(line, " log_regs %d", &v) == 1) cfg_log_regs = v ? 1 : 0;
 		else if (sscanf(line, " log_reads %d", &v) == 1) cfg_log_reads = v ? 1 : 0;
 		else if (sscanf(line, " log_sectors %d", &v) == 1) cfg_log_sectors = v ? 1 : 0;
+		else if (sscanf(line, " log_cpu %d", &v) == 1) cfg_log_cpu = v ? 1 : 0;
 		else if (sscanf(line, " video_x %lf", &d) == 1) cfg_video_x = d;
 		else if (sscanf(line, " video_y %d", &v) == 1) cfg_video_y = v;
 	}
@@ -1679,6 +1745,7 @@ void ld_poll()
 	for (int i = 0; i < count; i++)
 	{
 		uint16_t e = entries[i];
+		if ((e & 0xC100) == 0x0100) { probe_entry(e); continue; }   // sub-CPU probe sample
 		log_entry(e);
 		if (e == LD_LOG_GA_RESET)
 		{
@@ -1695,6 +1762,13 @@ void ld_poll()
 		ld_log("PD6103A log overflowed: commands were lost");
 		send_control(1);
 	}
+	static uint32_t probe_at = 0;
+	if (cfg_log_cpu && (!probe_at || CheckTimer(probe_at)))
+	{
+		probe_at = GetTimer(1000);
+		probe_report();
+	}
+
 	// audio read-ahead: a line every 10 s while the disc plays
 	static uint32_t audio_report = 0;
 	static uint32_t audio_last = 0;
@@ -1727,7 +1801,7 @@ void ld_poll()
 		reads_paused = 0;
 		send_control(0);
 	}
-	else if (pend && cfg_log_reads)
+	else if (pend && (cfg_log_reads || cfg_log_cpu))
 	{
 		// reads may have arrived since the drain, so that ack can miss
 		reads_paused = 1;
