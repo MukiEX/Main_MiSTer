@@ -90,7 +90,7 @@ static const char *root_path(const char *name)
 struct lq_slot { uint8_t file; char text[LQ_LEN]; };
 static lq_slot lq[LQ_SLOTS];
 static unsigned lq_head, lq_tail;          // head: next to write; tail: next free
-static unsigned lq_dropped;
+static unsigned lq_dropped[2];   // laseractive.log, register log
 static pthread_mutex_t lq_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t lq_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t lq_write_mtx = PTHREAD_MUTEX_INITIALIZER;   // one writer at a time
@@ -105,17 +105,18 @@ static void lq_write_batch()
 	for (;;)
 	{
 		pthread_mutex_lock(&lq_mtx);
-		unsigned n = 0, dropped = lq_dropped;
-		lq_dropped = 0;
+		unsigned n = 0, dropped = lq_dropped[0], dropped_regs = lq_dropped[1];
+		lq_dropped[0] = lq_dropped[1] = 0;
 		while (lq_head != lq_tail && n < 256) batch[n++] = lq[lq_head++ % LQ_SLOTS];
 		pthread_mutex_unlock(&lq_mtx);
-		if (!n && !dropped) return;
+		if (!n && !dropped && !dropped_regs) return;
 		for (unsigned i = 0; i < n; i++)
 		{
 			FILE *fp = batch[i].file ? regs_fp : log_fp;
 			if (fp) { fputs(batch[i].text, fp); fputc('\n', fp); }
 		}
 		if (dropped && log_fp) fprintf(log_fp, "%8.3f  log: %u lines were dropped (the card fell behind)\n", GetTimer(0) / 1000.0, dropped);
+		if (dropped_regs && regs_fp) fprintf(regs_fp, "%8.3f  (%u lines dropped: the card fell behind)\n", GetTimer(0) / 1000.0, dropped_regs);
 		if (n < 256) break;
 	}
 	if (log_fp) fflush(log_fp);
@@ -128,7 +129,7 @@ static void *lq_thread_fn(void *)
 	for (;;)
 	{
 		pthread_mutex_lock(&lq_mtx);
-		if (lq_head == lq_tail && !lq_dropped)
+		if (lq_head == lq_tail && !lq_dropped[0] && !lq_dropped[1])
 		{
 			struct timespec ts;
 			clock_gettime(CLOCK_REALTIME, &ts);
@@ -169,7 +170,9 @@ static void lq_push(int file, const char *text)
 		return;
 	}
 	pthread_mutex_lock(&lq_mtx);
-	if (lq_tail - lq_head >= LQ_SLOTS) lq_dropped++;
+	// the register log may fill only 3/4 of the queue, so it can't crowd
+	// out laseractive.log
+	if (lq_tail - lq_head >= (file ? LQ_SLOTS * 3 / 4 : LQ_SLOTS)) lq_dropped[file ? 1 : 0]++;
 	else
 	{
 		lq_slot &s = lq[lq_tail++ % LQ_SLOTS];
@@ -1384,11 +1387,19 @@ static const uint8_t driven_regs[] = { 0x02, 0x03, 0x04, 0x06, 0x07, 0x08, 0x09,
 
 // -------------------------------------------------------------- HPS <-> core
 
+// log_reads: the core logs reads too, but it only drops the "command
+// pending" busy (out 06 bit 7) when its log is empty as the ack arrives.
+// Something polling the chip keeps the log from ever being empty, so the
+// busy stuck on and the BIOS waited forever (Road Blaster "froze at the
+// BIOS" with log_reads on). While a command is pending, read logging is
+// paused for one poll, so the log empties and the ack lands.
+static int reads_paused = 0;
+
 static void send_control(int clear_ovf)
 {
 	spi_uio_cmd_cont(UIO_LD_SET);
 	spi_w(LD_SET_OP_CONTROL);
-	spi_w((cfg_log_reads ? 1 : 0) | (clear_ovf ? 2 : 0));
+	spi_w(((cfg_log_reads && !reads_paused) ? 1 : 0) | (clear_ovf ? 2 : 0));
 	DisableIO();
 }
 
@@ -1505,16 +1516,58 @@ static void log_entry(uint16_t e)
 		if (!regs_fp) return;
 		lq_start();
 	}
-	char line[96];
+	// Reads: the BIOS and games poll tens of thousands of times a second,
+	// more than the card can take, so a read is logged only when it returns
+	// something other than the last read of that register did (or it's the
+	// first since a write). The repeats are counted, and summed up once a
+	// second.
+	static int last_read[64];          // [out*32 + reg]: value + 1, 0 = none since a write
+	static uint32_t repeats[64];
+	static uint32_t summary_at;
+	char line[400];
 	if (e == LD_LOG_GA_RESET)
+	{
 		snprintf(line, sizeof(line), "%8.3f  -- gate-array reset --", GetTimer(0) / 1000.0);
+		memset(last_read, 0, sizeof(last_read));
+	}
 	else
 	{
 		int is_read = (e >> 15) & 1, is_out = (e >> 14) & 1, reg = (e >> 9) & 0x1F, alt = (e >> 8) & 1;
-		snprintf(line, sizeof(line), "%8.3f  %c %s %02X = %02X%s", GetTimer(0) / 1000.0, is_read ? 'R' : 'W', is_out ? "out" : "in ", reg, e & 0xFF,
-			(is_read && alt) ? "  (snapshot/held)" : "");
+		if (is_read)
+		{
+			int k = is_out * 32 + reg, v = (e & 0xFF) + (alt << 8) + 1;
+			if (last_read[k] == v) repeats[k]++;
+			else
+			{
+				last_read[k] = v;
+				snprintf(line, sizeof(line), "%8.3f  R %s %02X = %02X%s", GetTimer(0) / 1000.0, is_out ? "out" : "in ", reg, e & 0xFF,
+					alt ? "  (snapshot/held)" : "");
+				lq_push(1, line);
+			}
+		}
+		else
+		{
+			memset(last_read, 0, sizeof(last_read));
+			snprintf(line, sizeof(line), "%8.3f  W %s %02X = %02X", GetTimer(0) / 1000.0, is_out ? "out" : "in ", reg, e & 0xFF);
+			lq_push(1, line);
+		}
 	}
-	lq_push(1, line);
+	if (e == LD_LOG_GA_RESET) lq_push(1, line);
+
+	if (!summary_at || CheckTimer(summary_at))
+	{
+		summary_at = GetTimer(1000);
+		int n = snprintf(line, sizeof(line), "%8.3f  (repeated reads in the last second:", GetTimer(0) / 1000.0);
+		int any = 0;
+		for (int k = 0; k < 64 && n < (int)sizeof(line) - 24; k++)
+			if (repeats[k])
+			{
+				n += snprintf(line + n, sizeof(line) - n, " %s %02X x%u", k >= 32 ? "out" : "in", k & 31, repeats[k]);
+				repeats[k] = 0;
+				any = 1;
+			}
+		if (any) { snprintf(line + n, sizeof(line) - n, ")"); lq_push(1, line); }
+	}
 }
 
 // ------------------------------------------------------------------ public
@@ -1668,6 +1721,18 @@ void ld_poll()
 
 	update_outputs();
 	if (pend) send_ack();
+	if (reads_paused)
+	{
+		// the log was drained with reads off and the ack sent: reads back on
+		reads_paused = 0;
+		send_control(0);
+	}
+	else if (pend && cfg_log_reads)
+	{
+		// reads may have arrived since the drain, so that ack can miss
+		reads_paused = 1;
+		send_control(0);
+	}
 
 	// LaserDisc picture: shown when the player would mix it in and isn't blanking it
 	if (disc_has_video)
