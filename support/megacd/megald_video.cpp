@@ -23,7 +23,7 @@
 #define UIO_LD_VSET 0x52
 #define UIO_LD_VGET 0x53
 #define LDV_MAGIC    0x4C44  // reply to UIO_LD_VGET from a core with the LD video player
-#define LDV_VERSION  4       // commit protocol, picture position
+#define LDV_VERSION  4       // commit protocol, picture position (5: + download index 7)
 
 #define LDV_OP_CONTROL 0     // word: bit0 enable, bit1 restart, bit2 visible
 #define LDV_OP_PPS     1     // words: {addr[6:0], data[7:0]} ...
@@ -133,7 +133,18 @@ static int read_status()
 	}
 	for (int i = 0; i < 7; i++) st[i] = spi_w(0);
 	DisableIO();
-	return st[6] == LDV_VERSION;
+	return st[6] >= LDV_VERSION;
+}
+
+// The core's LaserDisc protocol version, 0 if it has none. 5 and up take CD
+// audio on download index 7, which doesn't reach the CDC.
+int ld_video_core_version()
+{
+	uint16_t magic = spi_uio_cmd_cont(UIO_LD_VGET);
+	uint16_t w[7] = {};
+	if (magic == LDV_MAGIC) for (int i = 0; i < 7; i++) w[i] = spi_w(0);
+	DisableIO();
+	return magic == LDV_MAGIC ? w[6] : 0;
 }
 
 // ------------------------------------------------------------ reader thread

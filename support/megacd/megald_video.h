@@ -34,5 +34,6 @@ void ld_video_poll();                    // call often from the main loop
 // Fine position of the LD picture under the VDP's: x in 1/256 LD columns,
 // y in LD lines (laseractive.cfg video_x / video_y)
 void ld_video_set_position(int x, int y);
+int  ld_video_core_version();             // the core's LaserDisc protocol version (0: none)
 
 #endif

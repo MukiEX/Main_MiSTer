@@ -9,6 +9,7 @@
 #include "megacd.h"
 #include "megald.h"
 #include "megald_mmi.h"
+#include "megald_video.h"
 #include "../chd/mister_chd.h"
 
 cdd_t cdd;
@@ -592,8 +593,19 @@ void cdd_t::LDStop()
 // late tick doesn't let it run dry (it holds only ~29 ms).
 // Where the disc's audio tracks and data track are in the archive, for the
 // read-ahead (megald_audio.cpp).
+// Where the CD audio of a tick that also carried a data sector goes. Into the
+// CDC as well (index 4), the CDC decodes it as a second sector: its header is
+// soundtrack samples, it raises a decoder interrupt and it's written into the
+// CDC buffer, so the buffer wraps twice as fast and the BIOS's read engine
+// loses sectors (Road Blaster's loads failed and then hung). Cores with
+// protocol 5 take it on index 7, for the CD audio FIFO only.
+static int ld_audio_index = MCD_CDDA_IO_INDEX;
+
 void cdd_t::LDStartReadAhead()
 {
+	int v = ld_video_core_version();
+	ld_audio_index = v >= 5 ? 7 : MCD_CDDA_IO_INDEX;
+	if (v < 5) ld_log("this core (LaserDisc protocol %d) sends the soundtrack under data sectors into the CDC too; data loads may fail", v);
 	std::vector<ld_audio_seg> segs;
 	ld_audio_seg data = { 0, 0, 0, 2352, 0 };
 	for (int i = 0; i < this->toc.last; i++)
@@ -708,7 +720,7 @@ void cdd_t::LDUpdate()
 	if (data || this->lba < this->toc.tracks[this->index].start) have_digital = 0;
 	if (!have_digital) memset(audio, 0, sizeof(audio));
 	ld_mix_audio(audio, analog, have_digital, have_analog);
-	if (SendData) SendData((uint8_t *)audio, 2352, MCD_CDDA_IO_INDEX);
+	if (SendData) SendData((uint8_t *)audio, 2352, data ? ld_audio_index : MCD_CDDA_IO_INDEX);
 	ld_audio_sent(GetTimer(0), this->lba);
 
 	int adv = ld_sector_advance();
